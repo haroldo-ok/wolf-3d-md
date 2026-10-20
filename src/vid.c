@@ -121,6 +121,7 @@ static void vint(void)
         Z80_disableBusProtection();
     }
     JOY_update();
+    in_latch |= JOY_readJoypad(JOY_1) & ~(BUTTON_UP | BUTTON_DOWN | BUTTON_LEFT | BUTTON_RIGHT);   /* D-pad is not latched: it would make movement coast */
     snd_tick();
 }
 

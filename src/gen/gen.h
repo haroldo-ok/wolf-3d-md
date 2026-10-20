@@ -16,6 +16,8 @@ extern const s16 pixelangle[128];
 extern const u8 rndtable[256];
 extern const u32 recip_step[513];
 extern const s32 proj_scale, proj_heightnumerator;
+extern const u32 scaler_ofs[];
+extern const u16 scaler_code[];
 extern const u32 wall_ofs[NUMWALLPAGES];
 extern const u8 wall_data[];
 extern const sprhdr_t spr_hdr[NUMSPRITES];

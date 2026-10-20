@@ -2,6 +2,7 @@
 #include "vid.h"
 
 u16 in_held, in_pressed;
+volatile u16 in_latch;       /* buttons seen at any vblank since the last IN_Update (so short taps are not lost) */
 static u16 in_prev;
 
 void IN_Init(void)
@@ -12,7 +13,11 @@ void IN_Init(void)
 
 void IN_Update(void)
 {
-    u16 j = JOY_readJoypad(JOY_1);
+    u16 j;
+    SYS_disableInts();
+    j = JOY_readJoypad(JOY_1) | in_latch;
+    in_latch = 0;
+    SYS_enableInts();
     in_prev = in_held;
     in_held = j;
     in_pressed = j & ~in_prev;

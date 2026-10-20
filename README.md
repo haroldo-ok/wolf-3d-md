@@ -12,7 +12,7 @@ ROM: `rom.bin` (3 MB, 32 KB battery SRAM declared in the header).
 - Start: pause menu (New Game, Sound, Control, Load/Save Game, Read This!, View Scores, Back to Game)
 
 ## Notes
-- Rendering: 256x128 view, 128 two-pixel-wide rays, rendered to a 4bpp RAM buffer and DMA'd each frame (about 6 fps on hardware-accurate emulation). The Genesis has only 64 KB of RAM, so large data lives in ROM or is streamed.
+- Rendering: 256x128 view, 128 two-pixel-wide rays, rendered to a 4bpp RAM buffer and DMA'd each frame (about 8-9 fps on an accurate emulator). The Genesis has only 64 KB of RAM, so large data lives in ROM or is streamed. Speed-ups: wall columns are drawn by precompiled per-height 68000 scaler routines in ROM (`tools/scalers.py`, 20 cycles/row), rays between two rays that hit the same wall face are interpolated rather than cast, the grid walk is specialised per quadrant, wall distance uses 16-bit signed multiplies, and floor/ceiling are only filled where no wall draws.
 - Audio: Z80 PCM driver for digitized effects (the shareware has 21). AdLib effects are rendered offline with an OPL2 model into PCM. Music is the original IMF data converted into YM2612 (5 FM channels) + PSG tracks.
 - Save games: 3 slots in SRAM. High scores are stored there too.
 - Not included: demo playback, the registered episodes (not in the shareware data), and the 3-D view border effects of the PC version.

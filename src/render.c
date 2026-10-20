@@ -68,6 +68,18 @@ static inline s32 mulfrac(s32 a, u16 f)
     return (s32)r;
 }
 
+/* a (16 bit) * b (32 bit), result 32 bit */
+static inline u32 mul16x32(u16 a, u32 b)
+{
+    return (mulu16(a, b >> 16) << 16) + mulu16(a, (u16)b);
+}
+
+/* (t * f) >> 16 for unsigned t */
+static inline u32 mulhi(u32 t, u16 f)
+{
+    return mulu16(t >> 16, f) + (mulu16(t, f) >> 16);
+}
+
 static inline u16 divu32_16(u32 n, u16 d)
 {
     u32 r = n;
@@ -76,11 +88,26 @@ static inline u16 divu32_16(u32 n, u16 d)
     return (u16)r;
 }
 
+static s16 vc15, vs15;          /* viewcos / viewsin as signed 1.15 */
+
+static inline s32 muls16(s16 a, s16 b)
+{
+    s32 r = a;
+    __asm__("muls.w %1,%0" : "+d"(r) : "dm"(b) : "cc");
+    return r;
+}
+
+/* perpendicular distance -> projected wall height.  The deltas are taken in
+   1/512 tile units so that two signed 16x16 multiplies give nx as 8.8 in the
+   high word of the sum. */
 static inline s16 calc_height(s32 xint, s32 yint)
 {
-    s32 nx = FixedByFrac(xint - viewx, viewcos) - FixedByFrac(yint - viewy, viewsin);
-    if (nx < MINDIST) nx = MINDIST;
-    return divu32_16((u32)proj_heightnumerator, (u16)(nx >> 8));
+    s16 dx = (s16)((xint - viewx) >> 7);
+    s16 dy = (s16)((yint - viewy) >> 7);
+    s32 sum = muls16(dx, vc15) - muls16(dy, vs15);
+    s16 nx = (s16)(sum >> 16);
+    if (nx < (MINDIST >> 8)) nx = (MINDIST >> 8);
+    return divu32_16((u32)proj_heightnumerator, (u16)nx);
 }
 
 /* ------------------------------------------------------- transformations */
@@ -169,77 +196,142 @@ static inline const u8 *doorpage(s16 doornum, boolean vert)
     return wall_data + wall_ofs[p + (vert ? 1 : 0)];
 }
 
-static void cast_rays(void)
+static s16 c_midangle;
+static u16 c_xpd, c_xpu, c_ypd, c_ypu;
+static u16 rc_face[NRAYS];      /* which plain wall face a ray hit (0xFFFF = door/push wall) */
+
+typedef struct
 {
-    s16 pixx;
-    s16 midangle = viewangle * (FINEANGLES / ANGLES);
-    u16 xpd = (u16)viewx, xpu = (u16)(0x10000 - (u16)viewx);
-    u16 ypd = (u16)viewy, ypu = (u16)(0x10000 - (u16)viewy);
+    s32 xint, yint, xstep, ystep;
+    s16 xtile, ytile;
+    u16 xspot, yspot;
+    u8 vert;
+} dda_t;
+
+/* The grid walk of the ray caster: advance tile by tile until a nonzero tile is
+   entered.  entry 0 = start, 1 = continue after a rejected vertical hit,
+   2 = after a rejected horizontal hit.  Specialised per quadrant so the
+   direction tests are constants; returns the tile value hit. */
+static inline __attribute__((always_inline)) u8 dda_body(dda_t *d, u8 entry, s16 xs, s16 ys)
+{
+    register s32 xint = d->xint, yint = d->yint, xstep = d->xstep, ystep = d->ystep;
+    register s16 xtile = d->xtile, ytile = d->ytile;
+    register u16 xspot = d->xspot, yspot = d->yspot;
     u8 *tm = &tilemap[0][0];
     u8 *sv = &spotvis[0][0];
+    u8 hit;
 
-    for (pixx = 0; pixx < NRAYS; pixx++)
+    if (entry == 1) goto passvert;
+    if (entry == 2) goto passhoriz;
+vertcheck:
+    if (ys < 0 ? ((s16)(yint >> 16) <= ytile) : ((s16)(yint >> 16) >= ytile))
+        goto horizentry;
+vertentry:
+    hit = tm[xspot];
+    if (hit) { d->vert = 1; goto done; }
+passvert:
+    sv[xspot] = 1;
+    xtile += xs;
+    yint += ystep;
+    xspot = (xtile << 6) + (s16)(yint >> 16);
+    goto vertcheck;
+horizcheck:
+    if (xs < 0 ? ((s16)(xint >> 16) <= xtile) : ((s16)(xint >> 16) >= xtile))
+        goto vertentry;
+horizentry:
+    hit = tm[yspot];
+    if (hit) { d->vert = 0; goto done; }
+passhoriz:
+    sv[yspot] = 1;
+    ytile += ys;
+    xint += xstep;
+    yspot = ((s16)(xint >> 16) << 6) + ytile;
+    goto horizcheck;
+done:
+    d->xint = xint; d->yint = yint; d->xtile = xtile; d->ytile = ytile;
+    d->xspot = xspot; d->yspot = yspot;
+    return hit;
+}
+
+static u8 dda_pp(dda_t *d, u8 e) { return dda_body(d, e, 1, 1); }
+static u8 dda_pm(dda_t *d, u8 e) { return dda_body(d, e, 1, -1); }
+static u8 dda_mp(dda_t *d, u8 e) { return dda_body(d, e, -1, 1); }
+static u8 dda_mm(dda_t *d, u8 e) { return dda_body(d, e, -1, -1); }
+
+static inline u8 dda_run(dda_t *d, u8 entry, s16 xs, s16 ys)
+{
+    if (xs > 0) return ys > 0 ? dda_pp(d, entry) : dda_pm(d, entry);
+    return ys > 0 ? dda_mp(d, entry) : dda_mm(d, entry);
+}
+
+/* one ray (WL_DRAW.C: AsmRefresh) */
+static void cast_ray(s16 pixx)
+{
+    s16 midangle = c_midangle;
+    u16 xpd = c_xpd, xpu = c_xpu;
+    u16 ypd = c_ypd, ypu = c_ypu;
+    u8 *tm = &tilemap[0][0];
+
+    rc_face[pixx] = 0xFFFF;
     {
+
         s16 angle = midangle + pixelangle[pixx];
         s16 xtilestep, ytilestep;
         s32 xstep, ystep, xint, yint, ex, ey, mid;
-        u16 xpartial, ypartial;
         s16 xtile, ytile, col, page, dn;
         u16 xspot, yspot;
-        u8 tilehit;
+        u8 tilehit, entry;
+        dda_t st;
 
         if (angle < 0) angle += FINEANGLES;
         else if (angle >= ANG360) angle -= FINEANGLES;
 
         if (angle < ANG90)
         {
+            u32 t1 = finetangent[ANG90 - 1 - angle], t2 = finetangent[angle];
             xtilestep = 1; ytilestep = -1;
-            xstep = finetangent[ANG90 - 1 - angle];
-            ystep = -finetangent[angle];
-            xpartial = xpu; ypartial = ypd;
+            xstep = t1; ystep = -(s32)t2;
+            xint = viewx + mulhi(t1, ypd);
+            yint = viewy - mulhi(t2, xpu);
         }
         else if (angle < ANG180)
         {
+            u32 t1 = finetangent[angle - ANG90], t2 = finetangent[ANG180 - 1 - angle];
             xtilestep = -1; ytilestep = -1;
-            xstep = -finetangent[angle - ANG90];
-            ystep = -finetangent[ANG180 - 1 - angle];
-            xpartial = xpd; ypartial = ypd;
+            xstep = -(s32)t1; ystep = -(s32)t2;
+            xint = viewx - mulhi(t1, ypd);
+            yint = viewy - mulhi(t2, xpd);
         }
         else if (angle < ANG270)
         {
+            u32 t1 = finetangent[ANG270 - 1 - angle], t2 = finetangent[angle - ANG180];
             xtilestep = -1; ytilestep = 1;
-            xstep = -finetangent[ANG270 - 1 - angle];
-            ystep = finetangent[angle - ANG180];
-            xpartial = xpd; ypartial = ypu;
+            xstep = -(s32)t1; ystep = t2;
+            xint = viewx - mulhi(t1, ypu);
+            yint = viewy + mulhi(t2, xpd);
         }
         else
         {
+            u32 t1 = finetangent[angle - ANG270], t2 = finetangent[ANG360 - 1 - angle];
             xtilestep = 1; ytilestep = 1;
-            xstep = finetangent[angle - ANG270];
-            ystep = finetangent[ANG360 - 1 - angle];
-            xpartial = xpu; ypartial = ypu;
+            xstep = t1; ystep = t2;
+            xint = viewx + mulhi(t1, ypu);
+            yint = viewy + mulhi(t2, xpu);
         }
-
-        yint = viewy + mulfrac(ystep, xpartial);
         xtile = focaltx + xtilestep;
         xspot = (xtile << 6) + (yint >> 16);
-        xint = viewx + mulfrac(xstep, ypartial);
         ytile = focalty + ytilestep;
         yspot = ((xint >> 16) << 6) + ytile;
 
-vertcheck:
-        if (ytilestep < 0 ? ((yint >> 16) <= ytile) : ((yint >> 16) >= ytile))
-            goto horizentry;
-vertentry:
-        tilehit = tm[xspot];
-        if (tilehit)
-            goto hitvert;
-passvert:
-        sv[xspot] = 1;
-        xtile += xtilestep;
-        yint += ystep;
-        xspot = (xtile << 6) + (yint >> 16);
-        goto vertcheck;
+        st.xint = xint; st.yint = yint; st.xstep = xstep; st.ystep = ystep;
+        st.xtile = xtile; st.ytile = ytile; st.xspot = xspot; st.yspot = yspot;
+        entry = 0;
+dda_again:
+        tilehit = dda_run(&st, entry, xtilestep, ytilestep);
+        xint = st.xint; yint = st.yint; xtile = st.xtile; ytile = st.ytile;
+        xspot = st.xspot; yspot = st.yspot;
+        if (!st.vert)
+            goto hithoriz;
 
 hitvert:
         if (tilehit & 0x80)
@@ -249,7 +341,7 @@ hitvert:
                 /* sliding push wall */
                 mid = yint + mulfrac(ystep, pwallpos << 10);
                 if ((mid >> 16) != (yint >> 16))
-                    goto passvert;
+                    { entry = 1; goto dda_again; }
                 yint = mid;
                 ex = (s32)xtile << 16;
                 if (xtilestep == -1)
@@ -269,9 +361,9 @@ hitvert:
             dn = tilehit & 0x7f;
             mid = yint + (ystep >> 1);
             if ((mid >> 16) != (yint >> 16))
-                goto passvert;
+                { entry = 1; goto dda_again; }
             if ((u16)mid < doorposition[dn])
-                goto passvert;
+                { entry = 1; goto dda_again; }
             yint = mid;
             ex = ((s32)xtile << 16) + 0x8000;
             col = ((yint - doorposition[dn]) >> 10) & 63;
@@ -287,6 +379,7 @@ hitvert:
             ex += TILEGLOBAL;
         }
         wallheight[pixx] = calc_height(ex, yint);
+        rc_face[pixx] = xspot;
         if (tilehit & 0x40)
         {
             if (tm[((xtile - xtilestep) << 6) + (yint >> 16)] & 0x80)
@@ -299,20 +392,6 @@ hitvert:
         rc_tex[pixx] = wallpage(page, col);
         goto nextpix;
 
-horizcheck:
-        if (xtilestep < 0 ? ((xint >> 16) <= xtile) : ((xint >> 16) >= xtile))
-            goto vertentry;
-horizentry:
-        tilehit = tm[yspot];
-        if (tilehit)
-            goto hithoriz;
-passhoriz:
-        sv[yspot] = 1;
-        ytile += ytilestep;
-        xint += xstep;
-        yspot = ((xint >> 16) << 6) + ytile;
-        goto horizcheck;
-
 hithoriz:
         if (tilehit & 0x80)
         {
@@ -320,7 +399,7 @@ hithoriz:
             {
                 mid = xint + mulfrac(xstep, pwallpos << 10);
                 if ((mid >> 16) != (xint >> 16))
-                    goto passhoriz;
+                    { entry = 2; goto dda_again; }
                 xint = mid;
                 ey = (s32)ytile << 16;
                 col = (xint >> 10) & 63;
@@ -338,9 +417,9 @@ hithoriz:
             dn = tilehit & 0x7f;
             mid = xint + (xstep >> 1);
             if ((mid >> 16) != (xint >> 16))
-                goto passhoriz;
+                { entry = 2; goto dda_again; }
             if ((u16)mid < doorposition[dn])
-                goto passhoriz;
+                { entry = 2; goto dda_again; }
             xint = mid;
             ey = ((s32)ytile << 16) + 0x8000;
             col = ((xint - doorposition[dn]) >> 10) & 63;
@@ -355,6 +434,7 @@ hithoriz:
         else
             col = 63 - col;
         wallheight[pixx] = calc_height(xint, ey);
+        rc_face[pixx] = yspot | 0x8000;
         if (tilehit & 0x40)
         {
             if (tm[((xint >> 16) << 6) + ytile - ytilestep] & 0x80)
@@ -371,57 +451,91 @@ nextpix:
     }
 }
 
+static inline s16 divs32_16(s32 n, s16 d)
+{
+    s32 r = n;
+    __asm__("divs.w %1,%0" : "+d"(r) : "dm"(d) : "cc");
+    return (s16)r;
+}
+
+/* Ray m lies halfway between rays l and r.  If those hit the same wall face
+   the in-between ray is interpolated instead of cast: on a flat wall 1/z is
+   linear in screen x, so the projected height is the mean of the two, and the
+   texture column is interpolated perspective-correctly (u/z is linear too). */
+static boolean interp_ray(s16 m, s16 l, s16 r)
+{
+    u16 h1, h2;
+    s16 dc, u;
+    const u8 *p1, *p2;
+#ifdef NOINTERP
+    return FALSE;
+#endif
+
+    if (rc_face[l] == 0xFFFF || rc_face[l] != rc_face[r])
+        return FALSE;
+    h1 = wallheight[l];
+    h2 = wallheight[r];
+    p1 = rc_tex[l];
+    p2 = rc_tex[r];
+    wallheight[m] = (u16)(((u32)h1 + h2) >> 1);
+    dc = (s16)((p2 - p1) >> 6);
+    if (dc)
+    {
+        if (h1 > 8192) h1 = 8192;
+        if (h2 > 8192) h2 = 8192;
+        u = divs32_16((s32)dc * (s16)h2, (s16)(h1 + h2));
+        p1 += (s16)(u << 6);
+    }
+    rc_tex[m] = p1;
+    rc_face[m] = rc_face[l];
+    return TRUE;
+}
+
+/* Rays 0,4,8.. are cast in full; the rest are interpolated wherever the rays
+   around them hit the same wall face, and cast otherwise. */
+static void cast_rays(void)
+{
+    s16 a;
+    c_midangle = viewangle * (FINEANGLES / ANGLES);
+    c_xpd = (u16)viewx; c_xpu = (u16)(0x10000 - (u16)viewx);
+    c_ypd = (u16)viewy; c_ypu = (u16)(0x10000 - (u16)viewy);
+    for (a = 0; a < NRAYS; a += 4)
+        cast_ray(a);
+    cast_ray(NRAYS - 2);
+    cast_ray(NRAYS - 1);
+    for (a = 0; a < NRAYS - 4; a += 4)
+        if (!interp_ray(a + 2, a, a + 4))
+            cast_ray(a + 2);
+    for (a = 0; a < NRAYS - 3; a += 2)
+        if (!interp_ray(a + 1, a, a + 2))
+            cast_ray(a + 1);
+}
+
 /* ------------------------------------------------------------ drawing */
 
-/* scaled column of wall texels, one byte (two pixels) wide */
+/* scaled column of wall texels, one byte (two pixels) wide: runs a precompiled
+   scaler routine (see tools/scalers.py) for this wall height */
 static void draw_wall(u16 c, const u8 *tex, u16 H)
 {
-    u8 *dst = screenbuf + (c >> 2) * VIEW_COLBYTES + (c & 3);
-    u32 step, pos;
-    u16 n;
+    register const u8 *t __asm__("a0");
+    register u8 *d __asm__("a1");
+    u16 idx;
 
+    if (!H) return;
     if (H > 512) H = 512;
-    step = recip_step[H];
-    if (H >= VIEWH)
+    d = screenbuf + (c >> 2) * VIEW_COLBYTES + (c & 3);
+    if (H <= VIEWH)
     {
-        n = VIEWH;
-        pos = (u32)((H - VIEWH) >> 1) * step + (step >> 1);
+        d += ((VIEWH - H) >> 1) << 2;
+        idx = H;
     }
     else
-    {
-        n = H;
-        dst += ((VIEWH - H) >> 1) << 2;
-        pos = step >> 1;
-    }
-    {
-        register u32 i = pos >> 16, f = pos & 0xFFFF;
-        register u32 si = step >> 16, sf = step & 0xFFFF;
-        while (n >= 8)
-        {
-            __asm__ volatile(
-                "move.b (%[t],%[i].w),0(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),4(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),8(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),12(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),16(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),20(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),24(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                "move.b (%[t],%[i].w),28(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
-                : [i] "+d"(i), [f] "+d"(f)
-                : [t] "a"(tex), [d] "a"(dst), [si] "d"(si), [sf] "d"(sf)
-                : "memory", "cc");
-            dst += 32;
-            n -= 8;
-        }
-        while (n--)
-        {
-            *dst = tex[i & 0xFFFF];
-            dst += 4;
-            f += sf;
-            i += si + (f >> 16);
-            f &= 0xFFFF;
-        }
-    }
+        idx = VIEWH + ((H - (VIEWH - 1)) >> 1);
+    t = tex;
+    __asm__ volatile("jsr (%2)"
+                     : "+a"(t), "+a"(d)
+                     : "a"((const u8 *)scaler_code + scaler_ofs[idx])
+                     : "memory", "cc");
 }
 
 typedef struct
@@ -466,6 +580,38 @@ static void vis_setup(vis_t *v, s16 shapenum, s16 vx, u16 height, boolean nocull
     v->nextc = -1;
 }
 
+/* n rows of a scaled texel run, 16.16 position tp stepping by step */
+static inline void scale_run(u8 *dst, const u8 *tex, u32 pos, u32 step, u16 n)
+{
+    register u32 i = pos >> 16, f = pos & 0xFFFF;
+    register u32 si = step >> 16, sf = step & 0xFFFF;
+    while (n >= 8)
+    {
+        __asm__ volatile(
+            "move.b (%[t],%[i].w),0(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),4(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),8(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),12(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),16(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),20(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),24(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            "move.b (%[t],%[i].w),28(%[d])\n\t add.w %[sf],%[f]\n\t addx.w %[si],%[i]\n\t"
+            : [i] "+d"(i), [f] "+d"(f)
+            : [t] "a"(tex), [d] "a"(dst), [si] "d"(si), [sf] "d"(sf)
+            : "memory", "cc");
+        dst += 32;
+        n -= 8;
+    }
+    while (n--)
+    {
+        *dst = tex[i & 0xFFFF];
+        dst += 4;
+        f += sf;
+        i += si + (f >> 16);
+        f &= 0xFFFF;
+    }
+}
+
 /* draw ray column c of a sprite */
 static void sprite_col(vis_t *v, u16 c)
 {
@@ -479,7 +625,7 @@ static void sprite_col(vis_t *v, u16 c)
     u16 H = v->H;
 
     if (v->nextc != (s16)c)
-        v->tpos = (u32)(u16)(2 * c + 1 - xl) * v->step;
+        v->tpos = mul16x32((u16)(2 * c + 1 - xl), v->step);
     pos = v->tpos;
     v->tpos = pos + (v->step << 1);
     v->nextc = c + 1;
@@ -498,23 +644,18 @@ static void sprite_col(vis_t *v, u16 c)
         u8 *d;
         if (y0 == 0xFF) break;
         y1 = p[1];
-        r0 = top + ((y0 * H + 63) >> 6);
-        r1 = top + ((y1 * H + 63) >> 6);
+        r0 = top + ((mulu16(y0, H) + 63) >> 6);
+        r1 = top + ((mulu16(y1, H) + 63) >> 6);
         {
             const u8 *pix = p + 2 - y0;
             p += 2 + (y1 - y0);
             if (r0 < 0) r0 = 0;
             if (r1 > VIEWH) r1 = VIEWH;
             if (r0 >= r1) continue;
-            tp = (u32)(u16)(r0 - top) * v->step;
+            tp = mul16x32((u16)(r0 - top), v->step);
             d = col + (r0 << 2);
             r1 -= r0;
-            while (r1--)
-            {
-                *d = pix[tp >> 16];
-                d += 4;
-                tp += v->step;
-            }
+            scale_run(d, pix, tp, v->step, r1);
         }
     }
 }
@@ -607,6 +748,17 @@ static void build_vislist(void)
     }
 }
 
+/* store 'n' longwords (one row of 4 rays each) */
+static inline void fill_rows(u32 *p, u32 v, u16 n)
+{
+    while (n >= 8)
+    {
+        p[0] = v; p[1] = v; p[2] = v; p[3] = v; p[4] = v; p[5] = v; p[6] = v; p[7] = v;
+        p += 8; n -= 8;
+    }
+    while (n--) *p++ = v;
+}
+
 static u32 colseq[VIEWC];
 
 static void render_columns(void)
@@ -616,8 +768,25 @@ static void render_columns(void)
     {
         u8 *base = screenbuf + k * VIEW_COLBYTES;
         vid_wait_job(colseq[k]);       /* previous frame's upload of this column */
-        memset(base, 0x11, (VIEWH / 2) * 4);
-        memset(base + (VIEWH / 2) * 4, 0x00, (VIEWH / 2) * 4);
+        {
+            /* background only where no wall of this column's 4 rays will draw:
+               rows [0, st) ceiling and [en, VIEWH) floor */
+            u16 st = 0, en = VIEWH, a, b;
+            u32 *p;
+            for (r = 4 * k; r < 4 * k + 4; r++)
+            {
+                u16 H = wallheight[r] >> 2;
+                if (H >= VIEWH) continue;
+                a = (VIEWH - H) >> 1;
+                b = a + H;
+                if (!H) { a = b = VIEWH / 2; }
+                if (a > st) st = a;
+                if (b < en) en = b;
+            }
+            p = (u32 *)base;
+            fill_rows(p, 0x11111111UL, st);
+            fill_rows(p + en, 0UL, VIEWH - en);
+        }
         for (r = 4 * k; r < 4 * k + 4; r++)
             draw_wall(r, rc_tex[r], wallheight[r] >> 2);
         for (i = 0; i < numvis; i++)
@@ -662,6 +831,8 @@ void R_Frame(void)
 {
     viewsin = sintable[viewangle];
     viewcos = sintable[viewangle + ANGLES / 4];
+    vc15 = viewcos >> 1; if (vc15 > 32767) vc15 = 32767;
+    vs15 = viewsin >> 1; if (vs15 > 32767) vs15 = 32767;
     viewx = player->x - FixedByFrac(FOCALLENGTH, viewcos);
     viewy = player->y + FixedByFrac(FOCALLENGTH, viewsin);
     focaltx = viewx >> TILESHIFT;
@@ -690,6 +861,9 @@ volatile u32 dbg_frames;
 void ThreeDRefresh(void)
 {
     dbg_frames++;
+#ifdef VT_ANGLE
+    player->angle = VT_ANGLE;
+#endif
     viewangle = player->angle;
     if (gamestate.weapon >= 0 && gamestate.weapon <= wp_chaingun)
         weapon_spr = weaponscale[gamestate.weapon] + gamestate.weaponframe;

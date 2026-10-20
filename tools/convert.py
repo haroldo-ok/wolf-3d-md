@@ -16,6 +16,7 @@ from sprnames import sprite_names
 import pics as PICS
 import texts as TEXTS
 import audio as AUDIO
+import scalers as SCALERS
 import config as C
 
 FLOOR_COLOR = 0x19
@@ -250,7 +251,7 @@ def gen_header(d, pal3, outdir):
     h += "typedef struct { const u8 *p0; const u16 *p1; const char *name; u16 ceilcolor; s32 partics; } mapinfo_t;\n"
     h += "extern const s32 sintable[%d];\nextern const s32 finetangent[%d];\n" % (C.ANGLES + C.ANGLES // 4, C.FINEANGLES // 4)
     h += "extern const s16 pixelangle[%d];\nextern const u8 rndtable[256];\nextern const u32 recip_step[%d];\n" % (C.VIEWW // 2, 513)
-    h += "extern const s32 proj_scale, proj_heightnumerator;\n"
+    h += "extern const s32 proj_scale, proj_heightnumerator;\nextern const u32 scaler_ofs[];\nextern const u16 scaler_code[];\n"
     h += "extern const u32 wall_ofs[NUMWALLPAGES];\nextern const u8 wall_data[];\n"
     h += "extern const sprhdr_t spr_hdr[NUMSPRITES];\nextern const u16 spr_colofs[];\nextern const u8 spr_data[];\n"
     h += "extern const mapinfo_t mapinfo[NUMMAPS];\n"
@@ -327,6 +328,7 @@ def main():
     gen_soundtab(srcdir, outdir)
     print('pics bytes:', PICS.gen_pics(d, nm, pal3, outdir))
     TEXTS.gen_texts(d, outdir)
+    print("scalers (bytes, variants):", SCALERS.gen_scalers(outdir))
     print('audio (pcm bytes, music bytes, digi sounds):', AUDIO.gen_audio(d, srcdir, outdir))
     fh = PICS.gen_fonts(d, outdir)
     open(os.path.join(outdir, 'src/gen/pics.h'), 'a').write('')

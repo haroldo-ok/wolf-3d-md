@@ -257,7 +257,7 @@ int main(int argc, char **argv)
         profStart = getenv("WOLF_PROFSTART") ? (unsigned)atoi(getenv("WOLF_PROFSTART")) : 0;
     }
     for (currentFrame = 0; currentFrame < total; currentFrame++) {
-        if (g_prof && currentFrame == profStart) memset(g_prof, 0, 0x80000 * 4);
+        if (g_prof && currentFrame == profStart) memset(g_prof, 0, 0x200000 * 4);
         r_run();
         for (unsigned i = 0; i < shotCount; i++)
             if (shots[i].frame == currentFrame) { write_ppm(currentFrame); dump_ram(currentFrame); print_cpu(currentFrame); }
@@ -273,7 +273,7 @@ int main(int argc, char **argv)
         printf("\n");
     }
 
-    if (g_prof) { FILE *pf = fopen(getenv("WOLF_PROFOUT") ? getenv("WOLF_PROFOUT") : "/tmp/prof.bin", "wb"); fwrite(g_prof, 4, 0x80000, pf); fclose(pf); }
+    if (g_prof) { FILE *pf = fopen(getenv("WOLF_PROFOUT") ? getenv("WOLF_PROFOUT") : "/tmp/prof.bin", "wb"); fwrite(g_prof, 4, 0x200000, pf); fclose(pf); }
     if (wavf) { fclose(wavf); fprintf(stderr, "audio frames: %zu\n", wavframes); }
     free(rom);
     return 0;

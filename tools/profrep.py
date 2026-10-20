@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """profrep.py - summarise /tmp/prof.bin (cycles per word address) per function and (with -g) per source line"""
 import struct, subprocess, sys, collections, bisect
-h = struct.unpack('<%dI' % 0x80000, open('/tmp/prof.bin','rb').read())
+h = struct.unpack('<%dI' % 0x200000, open('/tmp/prof.bin','rb').read())
 nm = subprocess.run(['m68k-elf-nm','-n','out/release/rom.out'],capture_output=True,text=True).stdout
 syms=[(int(l.split()[0],16),l.split()[2]) for l in nm.splitlines() if len(l.split())==3 and l.split()[1] in 'tTwW']
 addrs=[a for a,_ in syms]
