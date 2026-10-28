@@ -52,6 +52,15 @@ void NewGame(s16 difficulty, s16 episode)
 
 int main(bool hardReset)
 {
+#ifdef STACKPAINT
+    {
+        /* test hook: fill the free stack area with a marker so a RAM dump shows the deepest
+           stack use (the lowest overwritten byte above the end of .bss) */
+        extern u8 _bend[];
+        u8 here, *p = _bend;
+        while (p < &here - 64) *p++ = 0x5A;
+    }
+#endif
     vid_init();
     IN_Init();
     HUD_Init();

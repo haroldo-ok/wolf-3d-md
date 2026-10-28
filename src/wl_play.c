@@ -394,7 +394,10 @@ static void CheckKeys(void)
         FinishPaletteShifts();
         US_ControlPanel();
         if (!startgame && !loadedgame)
+        {
+            ResumePlayScreen();
             StartMusic();
+        }
         if (loadedgame)
             playstate = ex_abort;
         lasttimecount = TimeCount;
@@ -422,7 +425,12 @@ void PlayLoop(void)
         MovePWalls();
 
         for (obj = player; obj; obj = obj->next)
+        {
             DoActor(obj);
+#if defined(VT_SEQ) || defined(VT_TOUR)
+            break;      /* test hook (render.c): actors stay put so every view is reproducible */
+#endif
+        }
 
         UpdatePaletteShifts();
 

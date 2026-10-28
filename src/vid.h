@@ -48,6 +48,7 @@ extern u8 screenbuf[SCREEN_BYTES];
 extern Surface viewsurf, statsurf, fullsurf;
 
 extern volatile u16 vid_front;
+extern volatile u16 vid_mode_serial;    /* bumped whenever screenbuf is repurposed (mode switches) */
 extern volatile u32 vid_frames;
 extern volatile u32 TimeCount;          /* 70 Hz */
 

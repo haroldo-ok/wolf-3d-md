@@ -123,6 +123,7 @@ extern boolean fizzlein;
 void SetupGameLevel(void);
 void ScanInfoPlane(void);
 void GameLoop(void);
+void ResumePlayScreen(void);
 void PlaySoundLocGlobal(u16 s, s32 gx, s32 gy);
 void UpdateSoundLoc(void);
 #define PlaySoundLocTile(s, tx, ty) \

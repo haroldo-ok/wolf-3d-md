@@ -8,6 +8,8 @@ static u16 in_prev;
 void IN_Init(void)
 {
     JOY_init();
+    /* only pad 1 is ever read: don't spend vblank time polling port 2 as well */
+    JOY_setSupport(PORT_2, JOY_SUPPORT_OFF);
     in_held = in_prev = in_pressed = 0;
 }
 

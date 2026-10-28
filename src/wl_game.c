@@ -260,6 +260,18 @@ static void FadeInLevel(void)
     vid_fade_to(game_pal0, game_pal1, border_pal, 20);
 }
 
+/* back from the control panel (which leaves the screen in its own mode, faded out):
+   rebuild the play screen and fade the view back in, as at the start of a level */
+void ResumePlayScreen(void)
+{
+    DrawPlayScreen();
+    vid_black();
+    ThreeDRefresh();
+    ThreeDRefresh();
+    vid_wait_idle();
+    vid_fade_to(game_pal0, game_pal1, border_pal, 10);
+}
+
 /* ------------------------------------------------------------- death cam */
 
 void DeathCamIntro(void)

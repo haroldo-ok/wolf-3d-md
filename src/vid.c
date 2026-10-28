@@ -10,6 +10,7 @@ u8 screenbuf[SCREEN_BYTES] __attribute__((aligned(4)));
 Surface viewsurf, statsurf, fullsurf;
 
 volatile u16 vid_front;
+volatile u16 vid_mode_serial;
 volatile u32 vid_frames;
 volatile u32 TimeCount;
 static u16 tickacc;
@@ -85,6 +86,26 @@ static void do_flip(void)
     VDP_setVerticalScroll(BG_A, vid_front ? 256 : 0);
 }
 
+/* 68000 RAM -> VRAM DMA of n bytes (even, not crossing a 128 KB source bank), VDP auto
+   increment already 2 and the Z80 already off the bus: the register writes of
+   DMA_doDmaFast without its per-call set-up */
+static inline void dma_to_vram(const u8 *src, u16 dst, u16 n)
+{
+    vu16 *pw = (vu16 *)VDP_CTRL_PORT;
+    u32 a = (u32)src >> 1;
+    u16 w = n >> 1;
+    static vu32 cmdbuf;
+    *pw = 0x9300 + (w & 0xff);
+    *pw = 0x9400 + (w >> 8);
+    *pw = 0x9500 + (a & 0xff);
+    *pw = 0x9600 + ((a >> 8) & 0xff);
+    *pw = 0x9700 + ((a >> 16) & 0x7f);
+    cmdbuf = VDP_DMA_VRAM_ADDR((u32)dst);
+    *pw = ((vu16 *)&cmdbuf)[0];
+    /* the triggering word is written from memory, as SGDK does (some consoles need it) */
+    *pw = ((vu16 *)&cmdbuf)[1];
+}
+
 static void vint(void)
 {
     u16 budget = vblank_budget;
@@ -95,10 +116,15 @@ static void vint(void)
 
     if (jhead != jtail)
     {
+        u16 t = jtail;
+        /* keep the Z80 off the 68000 bus for the whole batch rather than per transfer */
+        bool busTaken;
         Z80_enableBusProtection();
-        while (jhead != jtail && budget)
+        VDP_setAutoInc(2);
+        busTaken = Z80_getAndRequestBus(FALSE);
+        while (t != jhead && budget)
         {
-            DmaJob *j = &jobs[jtail];
+            DmaJob *j = &jobs[t];
             if (j->flags & JOB_FLIP)
             {
                 do_flip();
@@ -108,16 +134,21 @@ static void vint(void)
                 u16 n = j->len;
                 if (n > budget) n = budget & ~1;
                 if (!n) break;
-                DMA_doDma(DMA_VRAM, (void *)j->src, j->dst, n >> 1, 2);
+                if ((((u32)j->src ^ ((u32)j->src + n - 1)) & 0xFFFE0000) == 0)
+                    dma_to_vram(j->src, j->dst, n);
+                else
+                    DMA_doDma(DMA_VRAM, (void *)j->src, j->dst, n >> 1, 2);
                 j->src += n;
                 j->dst += n;
                 j->len -= n;
                 budget -= n;
                 if (j->len) break;
             }
-            jtail = (jtail + 1) % MAXJOBS;
+            t = (t + 1) % MAXJOBS;
+            jtail = t;
             vid_jdone++;
         }
+        if (!busTaken) Z80_releaseBus();
         Z80_disableBusProtection();
     }
     JOY_update();
@@ -140,6 +171,10 @@ static void surf_init(Surface *s, u8 *buf, u16 rows, u16 ncols, u16 tile)
 void surf_mark(Surface *s, s16 x, s16 w)
 {
     s16 c0, c1, c;
+    /* something other than the renderer drew over the view area: drop the renderer's
+       knowledge of what the view buffer holds (render.c background / spotvis state) */
+    if (s != &statsurf)
+        vid_mode_serial++;
     if (w <= 0) return;
     if (x < 0) { w += x; x = 0; }
     if (x + w > (s16)(s->ncols * 8)) w = s->ncols * 8 - x;
@@ -322,6 +357,7 @@ void vid_game_mode(void)
     VDP_setEnable(FALSE);
     map_rows(0);
     memset(screenbuf, 0, SCREEN_BYTES);
+    vid_mode_serial++;
     surf_markall(&statsurf);
     surf_markall(&viewsurf);
     vid_flush(&statsurf);
@@ -338,6 +374,7 @@ void vid_full_mode(void)
     VDP_setEnable(FALSE);
     map_rows(1);
     memset(screenbuf, 0, SCREEN_BYTES);
+    vid_mode_serial++;
     surf_markall(&fullsurf);
     vid_flush(&fullsurf);
     vid_wait_idle();
@@ -354,6 +391,7 @@ void vid_split_mode(void)
     VDP_setEnable(FALSE);
     map_rows(2);
     memset(screenbuf, 0, SCREEN_BYTES);
+    vid_mode_serial++;
     surf_markall(&fullsurf);
     surf_markall(&statsurf);
     vid_flush(&fullsurf);
