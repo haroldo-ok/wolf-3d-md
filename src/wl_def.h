@@ -197,6 +197,7 @@ extern boolean madenoise;
 extern objtype objlist[MAXACTORS];
 extern objtype *newobj, *player, *lastobj, *objfreelist, *killerobj;
 extern statobj_t statobjlist[MAXSTATS], *laststatobj;
+extern u16 stat_serial;
 extern doorobj_t doorobjlist[MAXDOORS], *lastdoorobj;
 
 extern u8 tilemap[MAPSIZE][MAPSIZE];
@@ -228,6 +229,7 @@ extern s16 viewangle;
 extern s32 viewsin, viewcos;
 extern s16 centerx;
 extern u16 wallheight[VIEWW / 2];
+extern u8 r_lowdetail;          /* render.c: 4 pixel wide rays */
 extern u16 pwallpos, pwallstate, pwallx, pwally;
 extern s16 pwalldir;
 extern u16 doorposition[MAXDOORS];

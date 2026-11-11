@@ -4,6 +4,7 @@
 #include <string.h>
 
 statobj_t statobjlist[MAXSTATS], *laststatobj;
+u16 stat_serial;                /* bumped whenever a static is added or moved (render.c caches their tiles) */
 
 typedef struct
 {
@@ -92,11 +93,13 @@ static void ClearInfo(s16 x, s16 y)
 
 void InitStaticList(void)
 {
+    stat_serial++;
     laststatobj = &statobjlist[0];
 }
 
 void SpawnStatic(s16 tilex, s16 tiley, s16 type)
 {
+    stat_serial++;
     laststatobj->shapenum = statinfo[type].picnum;
     laststatobj->tilex = tilex;
     laststatobj->tiley = tiley;
@@ -168,6 +171,7 @@ void PlaceItemType(s16 itemtype, s16 tilex, s16 tiley)
             break;
     }
 
+    stat_serial++;
     spot->shapenum = statinfo[type].picnum;
     spot->tilex = tilex;
     spot->tiley = tiley;

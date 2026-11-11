@@ -25,6 +25,8 @@ MOVEB_D0 = 0x1340   # move.b d0,d16(a1)       12 cycles, 4 bytes
 LOAD_D0 = 0x1018    # move.b (a0)+,d0          8 cycles, 2 bytes
 LEA_A0 = 0x41E8     # lea d16(a0),a0           8 cycles, 4 bytes
 RTS = 0x4E75
+WORD = 0x2000       # the same moves with word operands: low detail draws rays 4 pixels wide,
+                    # from textures that hold every texel twice (tools/walls2.py)
 
 def texel_rows(H):
     """texture column index drawn on each screen row for wall height H"""
@@ -41,24 +43,25 @@ def texel_rows(H):
         pos += step
     return rows
 
-def variant_plain(H):
+def variant_plain(H, wide):
     """the original encoding: one move.b d16(a0),d16(a1) per row"""
     w = []
     for r, t in enumerate(texel_rows(H)):
-        w += [MOVEB, t, 4 * r]
+        w += [MOVEB | WORD, 2 * t, 4 * r] if wide else [MOVEB, t, 4 * r]
     w.append(RTS)
     return w
 
-def variant(H):
+def variant(H, wide=False):
     """code words for wall height H (rows drawn = min(H, VIEWH))"""
     rows = texel_rows(H)
     n = len(rows)
     steps = [rows[i + 1] - rows[i] for i in range(n - 1)]
     if any(s not in (0, 1) for s in steps):
-        return variant_plain(H)     # skips texels: needs the displacement form
+        return variant_plain(H, wide)     # skips texels: needs the displacement form
+    size = WORD if wide else 0
     w = []
     if rows[0]:
-        w += [LEA_A0, rows[0]]
+        w += [LEA_A0, rows[0] * (2 if wide else 1)]
     i = 0
     while i < n:
         j = i
@@ -66,12 +69,12 @@ def variant(H):
             j += 1
         last = j == n
         if j - i >= 3:
-            w.append(LOAD_D0)
+            w.append(LOAD_D0 | size)
             for r in range(i, j):
-                w += [MOVEB_D0, 4 * r]
+                w += [MOVEB_D0 | size, 4 * r]
         else:
             for r in range(i, j):
-                w += [MOVEB_AP if (r == j - 1 and not last) else MOVEB_A, 4 * r]
+                w += [(MOVEB_AP if (r == j - 1 and not last) else MOVEB_A) | size, 4 * r]
         i = j
     w.append(RTS)
     return w
@@ -85,14 +88,29 @@ def heights():
         h += 2
     return hs
 
-def gen_scalers(outdir):
+def scaler_set(name, wide):
     code = []
     ofs = []
     for H in heights():
         ofs.append(len(code) * 2)
-        code += variant(max(H, 1))
-    t = '#include "gen.h"\n'
-    t += c_words("scaler_ofs", ofs, "u32")
-    t += c_words("scaler_code", code, "u16", per_line=16, align=2)
-    write(os.path.join(outdir, "src/gen/scalers.c"), t)
-    return len(code) * 2, len(ofs)
+        code += variant(max(H, 1), wide)
+    t = c_words("scaler_code" + name, code, "u16", per_line=16, align=2)
+    # scaler_tab[H], H = 0..512 pixels: the routine for that wall height and the offset of
+    # its first row in the screen column (walls taller than the view start on row 0)
+    t += "const scaler_ent_t scaler_tab%s[513] = {\n" % name
+    for H in range(513):
+        if H <= C.VIEWH:
+            idx, dst = H, ((C.VIEWH - H) >> 1) << 2
+        else:
+            idx, dst = C.VIEWH + ((H - (C.VIEWH - 1)) >> 1), 0
+        t += "{scaler_code%s+%d,%d,0},\n" % (name, ofs[idx] // 2, dst)
+    t += "};\n"
+    return t, len(code) * 2, len(ofs)
+
+def gen_scalers(outdir):
+    t, size, n = scaler_set("", False)
+    write(os.path.join(outdir, "src/gen/scalers.c"), '#include "gen.h"\n' + t)
+    # low detail: the same routines moving words
+    t2, size2, _ = scaler_set("2", True)
+    write(os.path.join(outdir, "src/gen/scalers2.c"), '#include "gen.h"\n' + t2)
+    return size + size2, n

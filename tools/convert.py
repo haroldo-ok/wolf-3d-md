@@ -17,6 +17,9 @@ import pics as PICS
 import texts as TEXTS
 import audio as AUDIO
 import scalers as SCALERS
+import rtables as RTABLES
+import weapon as WEAPON
+import walls2 as WALLS2
 import config as C
 
 FLOOR_COLOR = 0x19
@@ -251,7 +254,9 @@ def gen_header(d, pal3, outdir):
     h += "typedef struct { const u8 *p0; const u16 *p1; const char *name; u16 ceilcolor; s32 partics; } mapinfo_t;\n"
     h += "extern const s32 sintable[%d];\nextern const s32 finetangent[%d];\n" % (C.ANGLES + C.ANGLES // 4, C.FINEANGLES // 4)
     h += "extern const s16 pixelangle[%d];\nextern const u8 rndtable[256];\nextern const u32 recip_step[%d];\n" % (C.VIEWW // 2, 513)
-    h += "extern const s32 proj_scale, proj_heightnumerator;\nextern const u32 scaler_ofs[];\nextern const u16 scaler_code[];\n"
+    h += "extern const s32 proj_scale, proj_heightnumerator;\nextern const u16 scaler_code[];\n"
+    h += "typedef struct { const u16 *code; s16 dst; s16 pad; } scaler_ent_t;\nextern const scaler_ent_t scaler_tab[513];\n"
+    h += "extern const u16 scaler_code2[];\nextern const scaler_ent_t scaler_tab2[513];\nextern const u16 wall_data2[];\n"
     h += "extern const u32 wall_ofs[NUMWALLPAGES];\nextern const u8 wall_data[];\n"
     h += "extern const sprhdr_t spr_hdr[NUMSPRITES];\nextern const u16 spr_colofs[];\nextern const u8 spr_data[];\n"
     h += "extern const mapinfo_t mapinfo[NUMMAPS];\n"
@@ -329,6 +334,9 @@ def main():
     print('pics bytes:', PICS.gen_pics(d, nm, pal3, outdir))
     TEXTS.gen_texts(d, outdir)
     print("scalers (bytes, variants):", SCALERS.gen_scalers(outdir))
+    print("renderer tables bytes:", RTABLES.gen_rtables(outdir))
+    print("doubled wall bytes:", WALLS2.gen_walls2(outdir))
+    print("weapon sprites (tile bytes, most tiles, most sprites):", WEAPON.gen_weapon(outdir))
     print('audio (pcm bytes, music bytes, digi sounds):', AUDIO.gen_audio(d, srcdir, outdir))
     fh = PICS.gen_fonts(d, outdir)
     open(os.path.join(outdir, 'src/gen/pics.h'), 'a').write('')

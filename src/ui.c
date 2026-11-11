@@ -298,13 +298,14 @@ static s16 handle_menu(minfo_t *mi, mitem_t *it, void (*routine)(s16))
 #define MENU_Y  55
 #define MENU_W  178
 
-enum { M_NEW, M_SOUND, M_CONTROL, M_LOAD, M_SAVE, M_READ, M_SCORES, M_BACK, M_COUNT };
+enum { M_NEW, M_SOUND, M_CONTROL, M_DETAIL, M_LOAD, M_SAVE, M_READ, M_SCORES, M_BACK, M_COUNT };
 
 static mitem_t MainMenu[M_COUNT] =
 {
     {"New Game", 1},
     {"Sound", 1},
     {"Control", 1},
+    {"Detail: High", 1},
     {"Load Game", 1},
     {"Save Game", 0},
     {"Read This!", 2},
@@ -325,6 +326,7 @@ static void draw_main_menu(void)
     ui_window(MENU_X - 8, MENU_Y - 3, MENU_W, 13 * M_COUNT + 6);
     MainMenu[M_BACK].s = ingame ? "Back to Game" : "Back to Demo";
     MainMenu[M_SAVE].active = ingame ? 1 : 0;
+    MainMenu[M_DETAIL].s = r_lowdetail ? "Detail: Low" : "Detail: High";
 }
 
 /* ------------------------------------------------------------ new game */
@@ -933,6 +935,11 @@ void US_ControlPanel(void)
             break;
         case M_CONTROL:
             cp_control();
+            redraw = TRUE;
+            break;
+        case M_DETAIL:
+            /* 4 pixel wide rays: a coarser picture, drawn about half as much again as fast */
+            r_lowdetail = !r_lowdetail;
             redraw = TRUE;
             break;
         case M_LOAD:

@@ -3,13 +3,17 @@
  * The ray casting loop is a C transcription of WL_DR_A.ASM / WL_DRAW.C.
  * Rays are two pixels wide (VIEWW/2 rays); a first pass casts every ray and
  * records its wall column and height, the second pass renders the picture
- * one 8-pixel tile column at a time (floor/ceiling fill, walls, sprites,
- * weapon) and hands each finished column to the DMA queue, so the VRAM
+ * one 8-pixel tile column at a time (floor/ceiling fill, walls, sprites)
+ * and hands each finished column to the DMA queue, so the VRAM
  * upload overlaps the CPU work and no second RAM frame buffer is needed.
  */
 #include "wl_def.h"
 #include "vid.h"
+#include "r_asm.h"
+#include "gen/rtables.h"
+#include "gen/weapon.h"
 #include <string.h>
+#define offsetof(t, m) __builtin_offsetof(t, m)
 
 #define NRAYS       (VIEWW / 2)
 #define MAXVIS      64
@@ -19,16 +23,27 @@ s32 viewx, viewy;
 s16 viewangle;
 s32 viewsin, viewcos;
 s16 centerx = VIEWW / 2;
-u16 wallheight[NRAYS];
 s16 weapon_spr = -1;
+/* Detail: Low in the menu.  Only the even rays are cast and drawn, each 4 pixels wide (the
+   picture is the high detail one with every odd ray replaced by the ray to its left).  The
+   weapon and the status bar are not affected. */
+#ifdef VT_LOWDETAIL
+u8 r_lowdetail = 1;
+#else
+u8 r_lowdetail;
+#endif
 s16 weapon_dy;
 u16 game_pal0[16];
 const s16 dirangle[9] = {0, ANGLES / 8, 2 * ANGLES / 8, 3 * ANGLES / 8, 4 * ANGLES / 8,
                          5 * ANGLES / 8, 6 * ANGLES / 8, 7 * ANGLES / 8, 0};
 
-static const u8 *rc_tex[NRAYS];
+/* per ray results of the caster; defined in r_asm.s so one pointer reaches all three */
+extern const u8 *rc_tex[NRAYS];
+extern u16 rc_face[NRAYS];      /* which plain wall face a ray hit (0xFFFF = door/push wall) */
 static s16 horizwall[MAXWALLTILES], vertwall[MAXWALLTILES];
-static s16 focaltx, focalty;
+s16 focaltx, focalty;
+/* wall texture of every tile value per orientation, for r_asm.s; entry 64 is the door frame */
+const u8 *rc_wallptr_h[65], *rc_wallptr_v[65];
 
 /* --------------------------------------------------------------- math */
 
@@ -93,7 +108,7 @@ static inline u16 divu32_16(u32 n, u16 d)
     return (u16)r;
 }
 
-static s16 vc15, vs15;          /* viewcos / viewsin as signed 1.15 */
+s16 vc15, vs15;          /* viewcos / viewsin as signed 1.15 */
 
 static inline s32 muls16(s16 a, s16 b)
 {
@@ -201,15 +216,14 @@ static inline const u8 *doorpage(s16 doornum, boolean vert)
     return wall_data + wall_ofs[p + (vert ? 1 : 0)];
 }
 
-static s16 c_midangle;
-static u16 c_xpd, c_xpu, c_ypd, c_ypu;
-static u16 rc_face[NRAYS];      /* which plain wall face a ray hit (0xFFFF = door/push wall) */
+s16 c_midangle;
+u16 c_xpd, c_xpu, c_ypd, c_ypu;
 
 /* spotvis marks the tiles the rays crossed this frame.  Instead of clearing the whole
    64x64 map every frame, a tile counts as seen when it holds this frame's stamp
    (1..255); the map is only cleared when the stamp wraps or the video mode changes
    (spotvis lives inside screenbuf, which the menus and intermission screens reuse). */
-static u8 vis_stamp = 1;
+u8 vis_stamp = 1;
 static u16 vis_serial = 0xFFFF;
 #define TILE_SEEN(p)    (*(p) == vis_stamp)
 
@@ -278,8 +292,9 @@ static inline u8 dda_run(dda_t *d, u8 entry, s16 xs, s16 ys)
     return ys > 0 ? dda_mp(d, entry) : dda_mm(d, entry);
 }
 
-/* one ray (WL_DRAW.C: AsmRefresh) */
-static void cast_ray(s16 pixx)
+/* one ray (WL_DRAW.C: AsmRefresh).  r_asm.s casts the rays; this C version is the reference
+   it was written from, and still casts the rays that hit a sliding push wall. */
+__attribute__((used, noinline)) void cast_ray_c(s16 pixx)
 {
     s16 midangle = c_midangle;
     u16 xpd = c_xpd, xpu = c_xpu;
@@ -465,122 +480,63 @@ nextpix:
     }
 }
 
-static inline s16 divs32_16(s32 n, s16 d)
-{
-    s32 r = n;
-    __asm__("divs.w %1,%0" : "+d"(r) : "dm"(d) : "cc");
-    return (s16)r;
-}
+/* r_asm.s: cast all rays.  Rays 0,4,8.. are cast in full.  A ray halfway between two rays
+   that hit the same wall face is interpolated instead: on a flat wall 1/z is linear in
+   screen x, so the projected height is the mean of the two, and the texture column is
+   interpolated perspective-correctly (u/z is linear too).  The rest are cast. */
+void rc_cast(void);
 
-/* Ray m lies halfway between rays l and r.  If those hit the same wall face
-   the in-between ray is interpolated instead of cast: on a flat wall 1/z is
-   linear in screen x, so the projected height is the mean of the two, and the
-   texture column is interpolated perspective-correctly (u/z is linear too). */
-static boolean interp_ray(s16 m, s16 l, s16 r)
-{
-    u16 h1, h2;
-    s16 dc, u;
-    const u8 *p1, *p2;
-#ifdef NOINTERP
-    return FALSE;
-#endif
-
-    if (rc_face[l] == 0xFFFF || rc_face[l] != rc_face[r])
-        return FALSE;
-    h1 = wallheight[l];
-    h2 = wallheight[r];
-    p1 = rc_tex[l];
-    p2 = rc_tex[r];
-    wallheight[m] = (u16)(((u32)h1 + h2) >> 1);
-    dc = (s16)((p2 - p1) >> 6);
-    if (dc)
-    {
-        if (h1 > 8192) h1 = 8192;
-        if (h2 > 8192) h2 = 8192;
-        /* dc is 16 bit and h2 <= 8192: one muls.w instead of a __mulsi3 call */
-        u = divs32_16(muls16(dc, (s16)h2), (s16)(h1 + h2));
-        p1 += (s16)(u << 6);
-    }
-    rc_tex[m] = p1;
-    rc_face[m] = rc_face[l];
-    return TRUE;
-}
-
-/* Rays 0,4,8.. are cast in full; the rest are interpolated wherever the rays
-   around them hit the same wall face, and cast otherwise. */
 static void cast_rays(void)
 {
-    s16 a;
     c_midangle = viewangle * (FINEANGLES / ANGLES);
     c_xpd = (u16)viewx; c_xpu = (u16)(0x10000 - (u16)viewx);
     c_ypd = (u16)viewy; c_ypu = (u16)(0x10000 - (u16)viewy);
-    for (a = 0; a < NRAYS; a += 4)
-        cast_ray(a);
-    cast_ray(NRAYS - 2);
-    cast_ray(NRAYS - 1);
-    for (a = 0; a < NRAYS - 4; a += 4)
-        if (!interp_ray(a + 2, a, a + 4))
-            cast_ray(a + 2);
-    for (a = 0; a < NRAYS - 3; a += 2)
-        if (!interp_ray(a + 1, a, a + 2))
-            cast_ray(a + 1);
+    rc_cast();
 }
 
 /* ------------------------------------------------------------ drawing */
 
-/* scaled column of wall texels, one byte (two pixels) wide: runs a precompiled
-   scaler routine (see tools/scalers.py) for this wall height */
-static inline void draw_wall(u8 *dst, const u8 *tex, u16 H)
-{
-    register const u8 *t __asm__("a0");
-    register u8 *d __asm__("a1");
-    u16 idx;
-
-    if (H > 512) H = 512;
-    d = dst;
-    if (H <= VIEWH)
-    {
-        d += (u16)(((VIEWH - H) >> 1) << 2);
-        idx = H;
-    }
-    else
-        idx = VIEWH + ((H - (VIEWH - 1)) >> 1);
-    t = tex;
-    /* the scaler routines use d0 as a scratch register (tools/scalers.py) */
-    __asm__ volatile("jsr (%2)"
-                     : "+a"(t), "+a"(d)
-                     : "a"((const u8 *)scaler_code + scaler_ofs[idx])
-                     : "memory", "cc", "d0");
-}
-
+/* a visible sprite.  The layout is known to r_asm.s (r_asm.h). */
 typedef struct
 {
-    s16 shapenum;
-    s16 viewx;
-    u16 viewheight;
+    u16 viewheight;         /* sort key, and compared with wallheight[] to cull */
+    u16 nocull;             /* drawn over the walls whatever its distance (unused: the weapon is hardware sprites now) */
+    s16 xl;                 /* screen x of the left edge */
+    s16 top;                /* screen row of the top edge (negative when taller than the view) */
+    u32 step;               /* texels per pixel, 16.16 */
+    const u16 *rowtab;      /* spr_rowtab row of this height */
+    const u16 *colofs;      /* colofs[texel column] = offset of its posts in data */
+    const u8 *data;
+    s16 left, right;        /* non-empty texel columns */
     u16 H;
-    s16 xl, rc0, rc1;
-    s16 nextc;
-    u32 step, tpos;
-    const sprhdr_t *hdr;
-    boolean nocull;
+    s16 rc0, rc1;           /* ray columns to draw */
 } vis_t;
+_Static_assert(offsetof(vis_t, viewheight) == V_VIEWHEIGHT && offsetof(vis_t, nocull) == V_NOCULL &&
+               offsetof(vis_t, xl) == V_XL && offsetof(vis_t, top) == V_TOP &&
+               offsetof(vis_t, step) == V_STEP && offsetof(vis_t, rowtab) == V_ROWTAB &&
+               offsetof(vis_t, colofs) == V_COLOFS && offsetof(vis_t, data) == V_DATA &&
+               offsetof(vis_t, left) == V_LEFT && offsetof(vis_t, right) == V_RIGHT &&
+               offsetof(vis_t, H) == V_H && offsetof(vis_t, rc0) == V_RC0 &&
+               offsetof(vis_t, rc1) == V_RC1 && sizeof(vis_t) == V_SIZE && VIEWH == R_VIEWH,
+               "vis_t does not match r_asm.h");
 
-static vis_t vislist[MAXVIS];
-static s16 spr_top, spr_bot;    /* rows written by sprites in the current tile column */
-static vis_t *vorder[MAXVIS];
-static s16 numvis;
+/* the sprite list is rebuilt every frame: it lives in the tail of screenbuf that the game
+   mode leaves unused (see BG_TABLES below), not in the scarce work RAM */
+#define VISLIST_OFS     28320
+#define vislist         ((vis_t *)(screenbuf + VISLIST_OFS))
+_Static_assert(VISLIST_OFS + MAXVIS * V_SIZE <= SCREEN_BYTES, "screenbuf tail overflow");
+s16 spr_top, spr_bot;           /* rows written by sprites in the current tile column */
+vis_t *vorder[MAXVIS];
+s16 numvis;
 
 static void vis_setup(vis_t *v, s16 shapenum, s16 vx, u16 height, boolean nocull, u16 forceH)
 {
     s16 c1;
     u16 H = forceH ? forceH : (height >> 2);
-    v->shapenum = shapenum;
-    v->viewx = vx;
+    const sprhdr_t *h = &spr_hdr[shapenum];
     v->viewheight = height;
     v->nocull = nocull;
-    v->hdr = &spr_hdr[shapenum];
-    if (H == 0 || v->hdr->data_ofs == 0xFFFFFFFF)
+    if (H == 0 || h->data_ofs == 0xFFFFFFFF)
     {
         v->rc0 = 1; v->rc1 = 0;
         return;
@@ -588,16 +544,20 @@ static void vis_setup(vis_t *v, s16 shapenum, s16 vx, u16 height, boolean nocull
     if (H > 512) H = 512;
     v->H = H;
     v->xl = vx - (H >> 1);
+    v->top = (s16)(VIEWH - H) >> 1;
     v->step = recip_step[H];
+    v->rowtab = spr_rowtab + mulu16(H, 65);
+    v->left = h->left;
+    v->right = h->right;
+    v->colofs = spr_colofs + h->colidx - h->left;
+    v->data = spr_data + h->data_ofs;
     v->rc0 = v->xl >> 1;
     c1 = ((v->xl + H) >> 1) - 1;
     v->rc1 = c1 >= NRAYS ? NRAYS - 1 : c1;
     if (v->rc0 < 0) v->rc0 = 0;
-    v->nextc = -1;
     {
         /* trim the ray range to the shape's non-empty texel columns [left, right]
-           (sprite_col draws nothing outside them; the texel column grows with the ray) */
-        const sprhdr_t *h = v->hdr;
+           (nothing is drawn outside them; the texel column grows with the ray) */
         u32 st2 = v->step << 1, pos;
         if (v->rc0 > v->rc1) return;
         pos = mul16x32((u16)(2 * v->rc0 + 1 - v->xl), v->step);
@@ -615,175 +575,51 @@ static void vis_setup(vis_t *v, s16 shapenum, s16 vx, u16 height, boolean nocull
     }
 }
 
-/* n rows of a scaled texel run, 16.16 position tp stepping by step */
-static inline void scale_run(u8 *dst, const u8 *tex, u32 pos, u32 step, u16 n)
-{
-    register u32 i = pos >> 16, f = pos & 0xFFFF;
-    register u32 si = step >> 16, sf = step & 0xFFFF;
-    if (step == 0x8000)
-    {
-        /* exactly 2x (the weapon, always): every texel covers two rows */
-        register const u8 *t __asm__("a0") = tex + i;
-        register u8 *d __asm__("a1") = dst;
-        if (f & 0x8000)
-        {
-            /* the first row is the second half of a texel */
-            *d = *t++;
-            d += 4;
-            n--;
-        }
-        while (n >= 8)
-        {
-            __asm__ volatile(
-                "move.b (%[t])+,%%d0\n\t move.b %%d0,0(%[d])\n\t move.b %%d0,4(%[d])\n\t"
-                "move.b (%[t])+,%%d0\n\t move.b %%d0,8(%[d])\n\t move.b %%d0,12(%[d])\n\t"
-                "move.b (%[t])+,%%d0\n\t move.b %%d0,16(%[d])\n\t move.b %%d0,20(%[d])\n\t"
-                "move.b (%[t])+,%%d0\n\t move.b %%d0,24(%[d])\n\t move.b %%d0,28(%[d])\n\t"
-                "lea 32(%[d]),%[d]"
-                : [t] "+a"(t), [d] "+a"(d)
-                :
-                : "memory", "cc", "d0");
-            n -= 8;
-        }
-        while (n >= 2)
-        {
-            u8 b = *t++;
-            d[0] = b;
-            d[4] = b;
-            d += 8;
-            n -= 2;
-        }
-        if (n)
-            *d = *t;
-        return;
-    }
-    {
-        /* 8 rows per pass, then 4/2/1: the remainder used to run through a C loop at
-           about twice the cost per row, and most sprite posts are short */
-        register u8 *d = dst;
-        u16 c;
-        __asm__ volatile(
-        "   move.w  %[n],%[c]\n"
-        "   lsr.w   #3,%[c]\n"
-        "   bra.w   2f\n"
-        "1:\n"
-        "   move.b  (%[t],%[i].w),0(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),4(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),8(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),12(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),16(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),20(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),24(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),28(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   lea     32(%[d]),%[d]\n"
-        "2: dbra    %[c],1b\n"
-        "   btst    #2,%[n]\n"
-        "   beq.s   3f\n"
-        "   move.b  (%[t],%[i].w),0(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),4(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),8(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),12(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   lea     16(%[d]),%[d]\n"
-        "3: btst    #1,%[n]\n"
-        "   beq.s   4f\n"
-        "   move.b  (%[t],%[i].w),0(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   move.b  (%[t],%[i].w),4(%[d])\n   add.w   %[sf],%[f]\n   addx.w  %[si],%[i]\n"
-        "   addq.w  #8,%[d]\n"
-        "4: btst    #0,%[n]\n"
-        "   beq.s   5f\n"
-        "   move.b  (%[t],%[i].w),(%[d])\n"
-        "5:\n"
-            : [i] "+d"(i), [f] "+d"(f), [d] "+a"(d), [c] "=&d"(c)
-            : [t] "a"(tex), [n] "d"(n), [si] "d"(si), [sf] "d"(sf)
-            : "memory", "cc");
-    }
-}
-
-/* draw ray column c of a sprite */
-static void sprite_col(vis_t *v, u16 c)
-{
-    s16 xl = v->xl;
-    u32 pos;
-    s16 tcol;
-    const sprhdr_t *h = v->hdr;
-    const u8 *p;
-    u8 *col;
-    s16 top;
-    u16 H = v->H;
-
-    if (v->nextc != (s16)c)
-        v->tpos = mul16x32((u16)(2 * c + 1 - xl), v->step);
-    pos = v->tpos;
-    v->tpos = pos + (v->step << 1);
-    v->nextc = c + 1;
-
-    tcol = pos >> 16;
-    if (tcol < h->left || tcol > h->right)
-        return;
-    p = spr_data + h->data_ofs + spr_colofs[h->colidx + (tcol - h->left)];
-    col = screenbuf + (c >> 2) * VIEW_COLBYTES + (c & 3);
-    top = (s16)(VIEWH - H) >> 1;
-    for (;;)
-    {
-        u8 y0 = p[0], y1;
-        s16 r0, r1;
-        u32 tp;
-        u8 *d;
-        if (y0 == 0xFF) break;
-        y1 = p[1];
-        r0 = top + ((mulu16(y0, H) + 63) >> 6);
-        r1 = top + ((mulu16(y1, H) + 63) >> 6);
-        {
-            const u8 *pix = p + 2 - y0;
-            p += 2 + (y1 - y0);
-            if (r0 < 0) r0 = 0;
-            if (r1 > VIEWH) r1 = VIEWH;
-            if (r0 >= r1) continue;
-            if (r0 < spr_top) spr_top = r0;
-            if (r1 > spr_bot) spr_bot = r1;
-            tp = mul16x32((u16)(r0 - top), v->step);
-            d = col + (r0 << 2);
-            r1 -= r0;
-            scale_run(d, pix, tp, v->step, r1);
-        }
-    }
-}
+/* tilemap index of every static object, in the unused tail of screenbuf after vislist */
+#define STATSPOT_OFS    (VISLIST_OFS + MAXVIS * V_SIZE)
+#define statspot        ((u16 *)(screenbuf + STATSPOT_OFS))
+_Static_assert(STATSPOT_OFS + 2 * (MAXSTATS + 1) <= SCREEN_BYTES, "screenbuf tail overflow");
+static u16 statspot_serial = 0xFFFF, statspot_mode = 0xFFFF;
 
 static void build_vislist(void)
 {
-    s16 i, j, least;
+    s16 i, j, least, nstat;
+    const u16 *qs;
     statobj_t *sp;
     objtype *ob;
     s16 vx, vh;
     vis_t *v = vislist;
     vis_t *vend = vislist + MAXVIS;
 
-    /* most statics are out of sight: find the next one on a tile seen this frame (tight
-       loop: tilex:tiley read as one word, spot = (tilex << 6) | tiley since tiley < 64) */
-    for (sp = statobjlist; ; sp++)
+    /* Most statics are out of sight, so finding the ones on a tile seen this frame has to
+       be quick: statspot caches the tilemap index of every static, ending with the player's
+       own tile, which is always marked seen and so stops the scan without a counter. */
+    nstat = laststatobj - statobjlist;
+    if (statspot_serial != stat_serial || statspot_mode != vid_mode_serial)
+    {
+        statspot_serial = stat_serial;
+        statspot_mode = vid_mode_serial;
+        for (i = 0; i < nstat; i++)
+            statspot[i] = (statobjlist[i].tilex << 6) + statobjlist[i].tiley;
+    }
+    statspot[nstat] = (player->tilex << 6) + player->tiley;
+    for (qs = statspot; ; )
     {
         {
-            register statobj_t *q __asm__("a0") = sp;
-            u16 w, x;
+            register const u16 *q __asm__("a0") = qs;
+            u16 x;
             __asm__ volatile(
-                "1: cmpa.l  %[end],%[q]\n"
-                "   beq.s   2f\n"
-                "   move.w  (%[q]),%[w]\n"
-                "   move.w  %[w],%[x]\n"
-                "   lsr.w   #2,%[x]\n"
-                "   and.w   #0xFFC0,%[x]\n"
-                "   or.b    %[w],%[x]\n"
+                "1: move.w  (%[q])+,%[x]\n"
                 "   cmp.b   0(%[sv],%[x].w),%[st]\n"
-                "   beq.s   2f\n"
-                "   addq.l  #6,%[q]\n"
-                "   bra.s   1b\n"
-                "2:\n"
-                : [q] "+a"(q), [w] "=&d"(w), [x] "=&d"(x)
-                : [end] "a"(laststatobj), [sv] "a"(&spotvis[0][0]), [st] "d"(vis_stamp)
+                "   bne.s   1b\n"
+                : [q] "+a"(q), [x] "=&d"(x)
+                : [sv] "a"(&spotvis[0][0]), [st] "d"(vis_stamp)
                 : "cc", "memory");
-            sp = q;
+            qs = q;
         }
-        if (sp == laststatobj) break;
+        i = qs - statspot - 1;
+        if (i >= nstat) break;
+        sp = &statobjlist[i];
         if (sp->shapenum == -1) continue;
         if (TransformTile(sp->tilex, sp->tiley, &vx, &vh) && (sp->flags & FL_BONUS))
         {
@@ -807,6 +643,32 @@ static void build_vislist(void)
         spotloc = (ob->tilex << 6) + ob->tiley;
         visspot = &spotvis[0][0] + spotloc;
         tilespot = &tilemap[0][0] + spotloc;
+        {
+            /* most actors are nowhere near a tile seen this frame: rule those out with
+               nine compares before the full test below */
+            u16 near;
+            __asm__(
+                "   cmp.b   (%[v]),%[st]\n     beq.s 1f\n"
+                "   cmp.b   -1(%[v]),%[st]\n   beq.s 1f\n"
+                "   cmp.b   1(%[v]),%[st]\n    beq.s 1f\n"
+                "   cmp.b   -65(%[v]),%[st]\n  beq.s 1f\n"
+                "   cmp.b   -64(%[v]),%[st]\n  beq.s 1f\n"
+                "   cmp.b   -63(%[v]),%[st]\n  beq.s 1f\n"
+                "   cmp.b   63(%[v]),%[st]\n   beq.s 1f\n"
+                "   cmp.b   64(%[v]),%[st]\n   beq.s 1f\n"
+                "   cmp.b   65(%[v]),%[st]\n   beq.s 1f\n"
+                "   moveq   #0,%[r]\n          bra.s 2f\n"
+                "1: moveq   #1,%[r]\n"
+                "2:\n"
+                : [r] "=&d"(near)
+                : [v] "a"(visspot), [st] "d"(vis_stamp)
+                : "cc");
+            if (!near)
+            {
+                ob->flags &= ~FL_VISABLE;
+                continue;
+            }
+        }
         if (TILE_SEEN(visspot)
             || (TILE_SEEN(visspot - 1) && !*(tilespot - 1))
             || (TILE_SEEN(visspot + 1) && !*(tilespot + 1))
@@ -851,44 +713,9 @@ static void build_vislist(void)
         vorder[j + 1] = t;
     }
     (void)least;
-    /* the player's weapon, always on top */
-    if (weapon_spr >= 0)
-    {
-        v = &vislist[MAXVIS - 1];
-        vis_setup(v, weapon_spr, VIEWW / 2, 0, TRUE, VIEWH);
-        vorder[numvis++] = v;
-    }
 }
 
-/* store 'n' longwords (one row of 4 rays each) */
-static inline void fill_rows(u32 *p, u32 v, u16 n)
-{
-    /* move.l Dn,(An)+ is 12 cycles; GCC stored the constant as an immediate with a
-       displacement, 24 cycles per longword */
-    u16 c;
-    __asm__ volatile(
-        "   move.w  %[n],%[c]\n"
-        "   lsr.w   #3,%[c]\n"
-        "   bra.s   2f\n"
-        "1: move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "   move.l  %[v],(%[p])+\n"
-        "2: dbra    %[c],1b\n"
-        "   and.w   #7,%[n]\n"
-        "   bra.s   4f\n"
-        "3: move.l  %[v],(%[p])+\n"
-        "4: dbra    %[n],3b\n"
-        : [p] "+a"(p), [n] "+d"(n), [c] "=&d"(c)
-        : [v] "d"(v)
-        : "memory", "cc");
-}
-
-static u32 colseq[VIEWC];
+u32 colseq[VIEWC];              /* upload job of each tile column (vid_jdone when it is in VRAM) */
 
 /* Background bookkeeping, so the ceiling and floor are neither refilled nor re-uploaded
    where they already hold plain background:
@@ -905,22 +732,28 @@ static u32 colseq[VIEWC];
 #define bg_vbot         ((u8 (*)[VIEWC])(BG_TABLES + 4 * VIEWC))    /* [2][VIEWC] */
 static u16 bg_serial = 0xFFFF;
 _Static_assert(VIEW_BYTES + STAT_BYTES + MAPSIZE * MAPSIZE <= 26880, "BG_TABLES overlaps spotvis");
+_Static_assert(R_BG_TABLES == 26880 && R_VIEWC == VIEWC && R_NRAYS == NRAYS && R_COLBYTES == VIEW_COLBYTES &&
+               R_JOBSIZE == VID_JOBSIZE && R_MAXVIS == MAXVIS && R_MINDIST8 == (MINDIST >> 8) && R_DOORWALL == DOORWALL &&
+               ANG90 == 900 && R_SPOTVIS == 22784 && dr_normal == 0 && dr_elevator == 5 && R_JOBRING == VID_MAXJOBS * VID_JOBSIZE, "r_asm.h out of date");
 /* per frame scratch of render_columns' sprite sweep, also in the unused tail of screenbuf
    (after the VT_SEQ test checksums) */
-#define SPR_SWEEP       (screenbuf + 28160)
+#define SPR_SWEEP       (screenbuf + R_SPR_SWEEP)
 _Static_assert(26880 + 6 * VIEWC <= 27136 && 27136 + 240 * 4 <= 28160, "screenbuf tail overflow");
 _Static_assert(28160 + VIEWC + 2 * MAXVIS <= SCREEN_BYTES, "screenbuf tail overflow");
 
 #define CEIL4   0x11111111UL
 
+/* r_asm.s: the per tile column loop (background fill, wall scalers, sprites, upload) */
+void rc_columns(u8 *vtop, u16 vram);
+void rcl_columns(u8 *vtop, u16 vram);     /* the low detail version */
+
+u16 spr_nact;                   /* sprites in rc_columns' active list */
+
 static void render_columns(void)
 {
-    s16 k, r, i;
+    s16 i;
     u16 bank = vid_target ? 1 : 0;
-    u16 vram = (bank ? TILE_VIEW1 : TILE_VIEW0) * 32;
-    u8 *vtop = bg_vtop[bank], *vbot = bg_vbot[bank];
-    u8 *bfirst = SPR_SWEEP, *bnext = SPR_SWEEP + VIEWC, *act = SPR_SWEEP + VIEWC + MAXVIS;
-    u16 nact = 0;
+    u8 *bfirst = SPR_SWEEP, *bnext = SPR_SWEEP + VIEWC;
 
     if (bg_serial != vid_mode_serial)
     {
@@ -940,92 +773,12 @@ static void render_columns(void)
             bnext[i] = bfirst[c];
             bfirst[c] = i;
         }
+        spr_nact = 0;
     }
-    for (k = 0; k < VIEWC; k++)
-    {
-        u8 *base = screenbuf + k * VIEW_COLBYTES;
-        const u16 *wh = &wallheight[4 * k];
-        const u8 *const *tx = &rc_tex[4 * k];
-        u16 st = 0, en = VIEWH;             /* background rows: [0, st) ceiling, [en, VIEWH) floor */
-        u16 wt = VIEWH / 2, wb = VIEWH / 2; /* rows covered by walls: [wt, wb) */
-        u16 lo, hi, ct, cb;
-
-        vid_wait_job(colseq[k]);       /* previous frame's upload of this column */
-        for (r = 0; r < 4; r++)
-        {
-            u16 H = wh[r] >> 2, a, b;
-            if (H >= VIEWH) { wt = 0; wb = VIEWH; continue; }
-            if (!H) a = b = VIEWH / 2;
-            else
-            {
-                a = (VIEWH - H) >> 1;
-                b = a + H;
-                if (a < wt) wt = a;
-                if (b > wb) wb = b;
-            }
-            if (a > st) st = a;
-            if (b < en) en = b;
-        }
-        ct = bg_ctop[k];
-        if (st > ct) fill_rows((u32 *)base + ct, CEIL4, st - ct);
-        cb = bg_cbot[k];
-        if (en < cb) fill_rows((u32 *)base + en, 0UL, cb - en);
-
-        for (r = 0; r < 4; r++)
-        {
-            u16 H = wh[r] >> 2;
-            if (H) draw_wall(base + r, tx[r], H);
-        }
-        spr_top = VIEWH; spr_bot = 0;
-        if (numvis)
-        {
-            /* sweep: retire sprites that ended left of this column, then insert the ones
-               starting here, keeping the active list in vorder (far to near) order */
-            u16 j, m = 0;
-            u8 x;
-            for (j = 0; j < nact; j++)
-                if ((vorder[act[j]]->rc1 >> 2) >= k)
-                    act[m++] = act[j];
-            nact = m;
-            for (x = bfirst[k]; x != 0xFF; x = bnext[x])
-            {
-                j = nact++;
-                while (j > 0 && act[j - 1] > x)
-                {
-                    act[j] = act[j - 1];
-                    j--;
-                }
-                act[j] = x;
-            }
-            for (j = 0; j < nact; j++)
-            {
-                vis_t *v = vorder[act[j]];
-                s16 a, b;
-                a = v->rc0 > 4 * k ? v->rc0 : 4 * k;
-                b = v->rc1 < 4 * k + 3 ? v->rc1 : 4 * k + 3;
-                for (r = a; r <= b; r++)
-                {
-                    if (!v->nocull && wallheight[r] >= v->viewheight)
-                        continue;
-                    sprite_col(v, r);
-                }
-            }
-        }
-        if ((u16)spr_top < wt) wt = spr_top;
-        if ((u16)spr_bot > wb) wb = spr_bot;
-        bg_ctop[k] = wt;
-        bg_cbot[k] = wb;
-
-        /* upload only the tile rows that differ from what this VRAM bank already holds */
-        ct = wt >> 3;
-        cb = (wb + 7) >> 3;
-        lo = vtop[k] < ct ? vtop[k] : ct;
-        hi = vbot[k] > cb ? vbot[k] : cb;
-        vtop[k] = ct;
-        vbot[k] = cb;
-        if (lo < hi)
-            colseq[k] = vid_queue(base + lo * 32, vram + k * VIEW_COLBYTES + lo * 32, (hi - lo) * 32);
-    }
+    if (r_lowdetail)
+        rcl_columns(bg_vtop[bank], (bank ? TILE_VIEW1 : TILE_VIEW0) * 32);
+    else
+        rc_columns(bg_vtop[bank], (bank ? TILE_VIEW1 : TILE_VIEW0) * 32);
 }
 
 void R_SetLevelColors(u16 ceilcolor)
@@ -1043,13 +796,42 @@ void R_Init(void)
         vertwall[i] = (i - 1) * 2 + 1;
     }
     horizwall[0] = vertwall[0] = 0;
+    for (i = 0; i < 64; i++)
+    {
+        rc_wallptr_h[i] = horizwall[i] < NUMWALLPAGES ? wallpage(horizwall[i], 0) : wall_data;
+        rc_wallptr_v[i] = vertwall[i] < NUMWALLPAGES ? wallpage(vertwall[i], 0) : wall_data;
+    }
+    rc_wallptr_h[64] = wallpage(DOORWALL + 2, 0);
+    rc_wallptr_v[64] = wallpage(DOORWALL + 3, 0);
     memcpy(game_pal0, view_palette, 32);
 }
 
-volatile u32 dbg_t0, dbg_t1, dbg_t2, dbg_t3;
-volatile u32 dbg_d0, dbg_d1, dbg_d2;
+static u32 last_world, last_sprites;
+
+static inline u32 sig_add(u32 h, u32 v)
+{
+    return ((h << 5) | (h >> 27)) ^ v;
+}
+
+/* everything the walls of the view depend on: the viewpoint, the doors, the push wall */
+static u32 world_sig(void)
+{
+    u32 h = (u32)viewx;
+    const u16 *dp = doorposition, *de = doorposition + (lastdoorobj - doorobjlist);
+    h = sig_add(h, (u32)viewy);
+    h = sig_add(h, ((u32)(u16)viewangle << 16) | pwallstate);
+    h = sig_add(h, r_lowdetail);
+    h = sig_add(h, ((u32)pwallpos << 16) | (pwallx << 8) | pwally);
+    while (dp < de)
+        h = sig_add(h, *dp++);
+    return h;
+}
+
 void R_Frame(void)
 {
+    u32 world, sprites;
+    boolean recast;
+    s16 i;
     viewsin = sintable[viewangle];
     viewcos = sintable[viewangle + ANGLES / 4];
     vc15 = viewcos >> 1; if (vc15 > 32767) vc15 = 32767;
@@ -1059,22 +841,39 @@ void R_Frame(void)
     focaltx = viewx >> TILESHIFT;
     focalty = viewy >> TILESHIFT;
 
-    if (vis_serial != vid_mode_serial || ++vis_stamp == 0)
+    /* Nothing in the picture depends on anything but the state hashed below (the weapon
+       and the status bar are not part of the view), so when it is the same as in the last
+       frame drawn, that frame is simply left on screen.  The rays are still valid then;
+       only the sprite list has to be rebuilt to see whether a sprite moved or changed. */
+    world = world_sig();
+    recast = world != last_world || vis_serial != vid_mode_serial;
+    if (recast)
     {
-        /* first frame in this video mode, or the stamp wrapped: forget every old mark */
-        vis_serial = vid_mode_serial;
-        memset(spotvis, 0, sizeof(spotvis));
-        vis_stamp = 1;
+        if (vis_serial != vid_mode_serial || ++vis_stamp == 0)
+        {
+            /* first frame in this video mode, or the stamp wrapped: forget every old mark */
+            vis_serial = vid_mode_serial;
+            memset(spotvis, 0, sizeof(spotvis));
+            vis_stamp = 1;
+        }
+        spotvis[player->tilex][player->tiley] = vis_stamp;
+        cast_rays();
     }
-    spotvis[player->tilex][player->tiley] = vis_stamp;
-    dbg_t0 = vid_frames;
-    cast_rays();
-    dbg_t1 = vid_frames;
     build_vislist();
-    dbg_t2 = vid_frames;
+    sprites = numvis;
+    for (i = 0; i < numvis; i++)
+    {
+        const vis_t *v = vorder[i];
+        sprites = sig_add(sprites, ((u32)v->viewheight << 16) | (u16)v->xl);
+        sprites = sig_add(sprites, (u32)v->data);
+    }
+#ifndef VT_TOUR     /* the benchmark draws every frame, to stay comparable */
+    if (!recast && sprites == last_sprites)
+        return;
+#endif
+    last_world = world;
+    last_sprites = sprites;
     render_columns();
-    dbg_t3 = vid_frames;
-    dbg_d0 = dbg_t1 - dbg_t0; dbg_d1 = dbg_t2 - dbg_t1; dbg_d2 = dbg_t3 - dbg_t2;
     /* flip once everything is uploaded */
     vid_flip_queue();
 }
@@ -1082,6 +881,7 @@ void R_Frame(void)
 /* ------------------------------------------------------------------ */
 /* ThreeDRefresh: one frame of the 3-D view + status bar (WL_DRAW.C)   */
 
+_Static_assert(WP_FIRST_SPR == SPR_KNIFEREADY && SPR_CHAINATK4 == WP_FIRST_SPR + WP_FRAMES - 1, "weapon.h out of date");
 static const s16 weaponscale[4] = { SPR_KNIFEREADY, SPR_PISTOLREADY, SPR_MACHINEGUNREADY, SPR_CHAINREADY };
 
 volatile u32 dbg_frames;
@@ -1105,7 +905,14 @@ static void vt_check(void)
     SYS_disableInts();
     *(volatile u32 *)VDP_CTRL_PORT = VDP_READ_VRAM_ADDR((u32)vram);
     for (i = 0; i < VIEW_BYTES / 2; i++)
-        s = (s << 1 | s >> 31) ^ *(volatile u16 *)VDP_DATA_PORT;
+    {
+        u16 w = *(volatile u16 *)VDP_DATA_PORT;
+#ifdef VT_EVENSUM
+        /* checksum of the picture low detail has to show: every odd ray = the ray to its left */
+        w = (w & 0xFF00) | (w >> 8);
+#endif
+        s = (s << 1 | s >> 31) ^ w;
+    }
     SYS_enableInts();
     vt_sum[n] = s;
 }
@@ -1152,11 +959,22 @@ void ThreeDRefresh(void)
 #if defined(VT_SEQ) || defined(VT_TOUR)
     vt_place(dbg_frames);
 #endif
+#ifdef VT_DOORS
+    { void vt_doors(u32 n); vt_doors(dbg_frames); }
+#endif
     viewangle = player->angle;
     if (gamestate.weapon >= 0 && gamestate.weapon <= wp_chaingun)
         weapon_spr = weaponscale[gamestate.weapon] + gamestate.weaponframe;
     else
         weapon_spr = -1;
+#ifdef VT_NOWEAPON
+    weapon_spr = -1;
+#endif
+#ifdef VT_WEAPON
+    { extern const volatile u8 vt_weapon_sel; weapon_spr = SPR_KNIFEREADY + vt_weapon_sel; }
+#endif
+    /* the weapon is drawn by hardware sprites over the view */
+    vid_weapon(weapon_spr >= 0 ? weapon_spr - WP_FIRST_SPR : -1);
     R_Frame();
     vid_flush(&statsurf);
     fizzlein = FALSE;

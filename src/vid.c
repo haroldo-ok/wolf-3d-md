@@ -4,6 +4,7 @@
 #include "vid.h"
 #include "snd.h"
 #include "input.h"
+#include "gen/weapon.h"
 
 u8 screenbuf[SCREEN_BYTES] __attribute__((aligned(4)));
 
@@ -21,7 +22,8 @@ u16 cur_pal[64];
 
 /* ------------------------------------------------------------------ DMA */
 
-#define MAXJOBS     64
+/* The upload queue: a ring of jobs filled by the main program and drained by the V-int.
+   vid_jhead / vid_jtail are byte offsets into vid_jobs (r_asm.s appends to the ring too). */
 #define JOB_FLIP    1
 typedef struct
 {
@@ -30,30 +32,40 @@ typedef struct
     u16 len;
     u16 flags;
 } DmaJob;
+_Static_assert(sizeof(DmaJob) == VID_JOBSIZE, "DmaJob does not match vid.h");
 
-static DmaJob jobs[MAXJOBS];
-static volatile u16 jhead, jtail;
+DmaJob vid_jobs[VID_MAXJOBS];
+volatile u16 vid_jhead, vid_jtail;
 volatile u32 vid_jdone;
-static u32 jqueued;
+u32 vid_jqueued;
 u16 vid_target = 1;           /* view buffer being rendered into */
 static u16 vblank_budget = 7000;
 
+static inline u16 job_next(u16 ofs)
+{
+    ofs += VID_JOBSIZE;
+    return ofs == VID_MAXJOBS * VID_JOBSIZE ? 0 : ofs;
+}
+
+static u32 queue_job(const u8 *src, u16 dst, u16 len, u16 flags)
+{
+    u16 h = vid_jhead, n = job_next(h);
+    DmaJob *j;
+    while (n == vid_jtail)
+        vid_frame();
+    j = (DmaJob *)((u8 *)vid_jobs + h);
+    j->src = src;
+    j->dst = dst;
+    j->len = len;
+    j->flags = flags;
+    vid_jhead = n;
+    return ++vid_jqueued;
+}
+
 u32 vid_queue(const void *src, u16 dst, u16 len)
 {
-    u16 n;
-    if (!len) return jqueued;
-    for (;;)
-    {
-        n = (jhead + 1) % MAXJOBS;
-        if (n != jtail) break;
-        vid_frame();
-    }
-    jobs[jhead].src = src;
-    jobs[jhead].dst = dst;
-    jobs[jhead].len = len;
-    jobs[jhead].flags = 0;
-    jhead = n;
-    return ++jqueued;
+    if (!len) return vid_jqueued;
+    return queue_job(src, dst, len, 0);
 }
 
 void vid_wait_job(u32 seq)
@@ -64,19 +76,12 @@ void vid_wait_job(u32 seq)
 
 static void queue_flag(u16 flags)
 {
-    u16 n = (jhead + 1) % MAXJOBS;
-    while (n == jtail) { vid_frame(); n = (jhead + 1) % MAXJOBS; }
-    jobs[jhead].src = NULL;
-    jobs[jhead].len = 0;
-    jobs[jhead].dst = 0;
-    jobs[jhead].flags = flags;
-    jhead = n;
-    jqueued++;
+    queue_job(NULL, 0, 0, flags);
 }
 
 void vid_wait_idle(void)
 {
-    while (jhead != jtail)
+    while (vid_jhead != vid_jtail)
         vid_frame();
 }
 
@@ -114,17 +119,17 @@ static void vint(void)
     tickacc += vid_pal ? 84 : 70;     /* TimeCount runs at 70 Hz */
     while (tickacc >= 60) { tickacc -= 60; TimeCount++; }
 
-    if (jhead != jtail)
+    if (vid_jhead != vid_jtail)
     {
-        u16 t = jtail;
+        u16 t = vid_jtail, h = vid_jhead;
         /* keep the Z80 off the 68000 bus for the whole batch rather than per transfer */
         bool busTaken;
         Z80_enableBusProtection();
         VDP_setAutoInc(2);
         busTaken = Z80_getAndRequestBus(FALSE);
-        while (t != jhead && budget)
+        while (t != h && budget)
         {
-            DmaJob *j = &jobs[t];
+            DmaJob *j = (DmaJob *)((u8 *)vid_jobs + t);
             if (j->flags & JOB_FLIP)
             {
                 do_flip();
@@ -132,7 +137,11 @@ static void vint(void)
             else
             {
                 u16 n = j->len;
-                if (n > budget) n = budget & ~1;
+                if (n > budget)
+                {
+                    if (n <= 256) break;        /* small jobs (the sprite table) go out whole */
+                    n = budget & ~1;
+                }
                 if (!n) break;
                 if ((((u32)j->src ^ ((u32)j->src + n - 1)) & 0xFFFE0000) == 0)
                     dma_to_vram(j->src, j->dst, n);
@@ -144,8 +153,8 @@ static void vint(void)
                 budget -= n;
                 if (j->len) break;
             }
-            t = (t + 1) % MAXJOBS;
-            jtail = t;
+            t = job_next(t);
+            vid_jtail = t;
             vid_jdone++;
         }
         if (!busTaken) Z80_releaseBus();
@@ -154,6 +163,44 @@ static void vint(void)
     JOY_update();
     in_latch |= JOY_readJoypad(JOY_1) & ~(BUTTON_UP | BUTTON_DOWN | BUTTON_LEFT | BUTTON_RIGHT);   /* D-pad is not latched: it would make movement coast */
     snd_tick();
+}
+
+/* ---------------------------------------------------------------- weapon */
+
+/* The weapon is a set of hardware sprites over the view (tools/weapon.py).  A new frame is
+   uploaded to the tile bank that is not on screen, then the sprite table is switched to it. */
+_Static_assert(WP_TILE_BASE == TILE_BORDER + 1 && (WP_TILE_BASE + 2 * WP_MAXTILES) * 32 <= 0xC000,
+               "weapon tiles do not fit below the planes");
+static s16 wp_cur = -1;         /* frame on screen (or queued), -1 = none */
+static u16 wp_bank;
+
+void vid_weapon(s16 frame)
+{
+    static const u16 none[4] = {0, 0, 0, 0};
+    const wpframe_t *w;
+    if (frame >= WP_FRAMES) frame = -1;
+    if (frame == wp_cur) return;
+    wp_cur = frame;
+    if (frame < 0)
+    {
+        queue_job((const u8 *)none, SPRITE_ADDR, 8, 0);
+        return;
+    }
+    w = &wp_frames[frame];
+    wp_bank ^= 1;
+    {
+        /* a DMA source may not cross a 128 KB boundary: split the tiles there if need be */
+        u16 dst = (WP_TILE_BASE + wp_bank * WP_MAXTILES) * 32, n = w->tile_bytes;
+        u32 room = 0x20000 - ((u32)w->tiles & 0x1FFFF);
+        if (room < n)
+        {
+            queue_job(w->tiles, dst, room, 0);
+            queue_job(w->tiles + room, dst + room, n - room, 0);
+        }
+        else
+            queue_job(w->tiles, dst, n, 0);
+    }
+    queue_job((const u8 *)w->sat[wp_bank], SPRITE_ADDR, w->sat_bytes, 0);
 }
 
 /* ------------------------------------------------------------- surfaces */
@@ -174,7 +221,10 @@ void surf_mark(Surface *s, s16 x, s16 w)
     /* something other than the renderer drew over the view area: drop the renderer's
        knowledge of what the view buffer holds (render.c background / spotvis state) */
     if (s != &statsurf)
+    {
         vid_mode_serial++;
+        vid_weapon(-1);         /* and the weapon is not part of that picture */
+    }
     if (w <= 0) return;
     if (x < 0) { w += x; x = 0; }
     if (x + w > (s16)(s->ncols * 8)) w = s->ncols * 8 - x;
@@ -201,6 +251,7 @@ void vid_flush(Surface *s)
     u8 dh = s->dirty_hi;
     u16 vram = s->vram;
     u16 n = s->ncols;
+    if (!d && !dh) return;
     if (s == &viewsurf)
         vram = vid_target ? TILE_VIEW1 * 32 : TILE_VIEW0 * 32;
     s->dirty = 0;
@@ -312,15 +363,16 @@ void vid_init(void)
     /* plane B is never used: point it at a zeroed area so that colour 0 pixels of
        plane A (which are transparent) do not show a second, differently scrolled copy */
     VDP_setBGBAddress(0xC000);
-    /* the sprite attribute table also goes there: sprites are never used, and the SGDK default
-       location (0xF400) lies inside our tile data, which showed up as a stray 8x8 sprite */
-    VDP_setSpriteListAddress(0xC000);
+    /* the sprite attribute table goes into the part of that area that plane B never shows
+       (plane row 48): the SGDK default location (0xF400) lies inside our tile data, which
+       showed up as a stray 8x8 sprite.  Only the weapon uses sprites (vid_weapon). */
+    VDP_setSpriteListAddress(SPRITE_ADDR);
     {
         vu32 *ctrl = (vu32 *)VDP_CTRL_PORT;
         vu16 *data = (vu16 *)VDP_DATA_PORT;
         u16 i;
         *ctrl = VDP_WRITE_VRAM_ADDR(0xC000);
-        for (i = 0; i < 0x1400 / 2; i++)
+        for (i = 0; i < 0x2000 / 2; i++)
             *data = 0;
     }
     VDP_setWindowAddress(PLANE_ADDR);
@@ -349,6 +401,7 @@ void vid_init(void)
 
 void vid_game_mode(void)
 {
+    vid_weapon(-1);
     vid_wait_idle();
     vmode = 0;
     vid_front = 0;
@@ -368,6 +421,7 @@ void vid_game_mode(void)
 
 void vid_full_mode(void)
 {
+    vid_weapon(-1);
     vid_wait_idle();
     vmode = 1;
     surf_init(&fullsurf, screenbuf, 200, 40, 1);
@@ -384,6 +438,7 @@ void vid_full_mode(void)
 /* 320x160 picture area on top of the 40 pixel status bar (intermission) */
 void vid_split_mode(void)
 {
+    vid_weapon(-1);
     vid_wait_idle();
     vmode = 2;
     surf_init(&fullsurf, screenbuf, 160, 40, 1);
@@ -422,10 +477,22 @@ void vid_wait(u16 n)
 
 /* ------------------------------------------------------------- palette */
 
+/* palette line 3 (the weapon sprites) follows line 0, with view colour 0 in entry WP_ZERO_IDX */
+static void mirror_view_pal(u16 *pal64)
+{
+    memcpy(pal64 + 48, pal64, 32);
+    pal64[48 + WP_ZERO_IDX] = pal64[0];
+}
+
 void vid_set_pal(u16 line, const u16 *pal)
 {
     memcpy(&cur_pal[line * 16], pal, 32);
     PAL_setColors(line * 16, pal, 16, CPU);
+    if (line == 0)
+    {
+        mirror_view_pal(cur_pal);
+        PAL_setColors(48, cur_pal + 48, 16, CPU);
+    }
 }
 
 void vid_set_backdrop(u16 color)
@@ -455,24 +522,25 @@ static u16 lerp_col(u16 a, u16 b, u16 t, u16 n)
 void vid_fade_to(const u16 *p0, const u16 *p1, const u16 *p2, u16 frames)
 {
     static const u16 z[16];
-    u16 from[48], to[48], cur[48];
+    u16 from[64], to[64], cur[64];
     u16 f, i;
     if (!p0) p0 = z;
     if (!p1) p1 = z;
     if (!p2) p2 = z;
-    memcpy(from, cur_pal, 96);
+    memcpy(from, cur_pal, 128);
     memcpy(to, p0, 32);
     memcpy(to + 16, p1, 32);
     memcpy(to + 32, p2, 32);
+    mirror_view_pal(to);
     for (f = 1; f <= frames; f++)
     {
-        for (i = 0; i < 48; i++)
+        for (i = 0; i < 64; i++)
             cur[i] = lerp_col(from[i], to[i], f, frames);
         vid_frame();
-        PAL_setColors(0, cur, 48, CPU);
+        PAL_setColors(0, cur, 64, CPU);
     }
-    memcpy(cur_pal, to, 96);
-    PAL_setColors(0, to, 48, CPU);
+    memcpy(cur_pal, to, 128);
+    PAL_setColors(0, to, 64, CPU);
 }
 
 void vid_fade_out(u16 frames)

@@ -29,6 +29,7 @@
 #define TILE_BORDER     (TILE_STATUS + STAT_COLS * STAT_ROWS)
 #define PLANE_ADDR      0xE000
 #define HSCROLL_ADDR    0xD400
+#define SPRITE_ADDR     0xD800          /* sprite attribute table, in the unseen part of plane B */
 
 #define VIEW_CX0        ((40 - VIEWC) / 2)      /* plane cell of the view */
 #define VIEW_CY0        ((23 - VIEWR) / 2)
@@ -58,6 +59,10 @@ void vid_full_mode(void);               /* 320x200 2-D surface */
 void vid_split_mode(void);              /* 320x160 surface + status bar */
 boolean vid_isfull(void);
 
+/* the upload queue (vid.c; r_asm.s appends to it directly) */
+#define VID_MAXJOBS     64
+#define VID_JOBSIZE     10
+
 u32 vid_queue(const void *src, u16 vramdst, u16 len);
 void vid_wait_job(u32 seq);
 void vid_flip_queue(void);
@@ -69,6 +74,7 @@ void vid_wait(u16 frames);
 void surf_mark(Surface *s, s16 x, s16 w);
 void surf_markall(Surface *s);
 void vid_flush(Surface *s);
+void vid_weapon(s16 frame);             /* show weapon frame 0..WP_FRAMES-1 as sprites, -1 = none */
 void vid_present_view(void);            /* queue whole view to back buffer + flip */
 void vid_update(void);                  /* flush surfaces and wait */
 

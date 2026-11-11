@@ -254,6 +254,7 @@ boolean Save_Read(s16 slot)
     if (n > MAXSTATS) n = 0;
     rmem(statobjlist, n * sizeof(statobj_t));
     laststatobj = &statobjlist[n];
+    stat_serial++;
 
     rmem(&n, 2);
     InitActorList();
