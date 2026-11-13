@@ -156,7 +156,7 @@ void LevelCompleted(void)
 
     if (mapon < 8)
     {
-        par = mapinfo[mapon].partics;           /* tics */
+        par = mapinfo[MAPINDEX()].partics;     /* tics */
         Write(14, 2, "floor\ncompleted");
         Write(14, 7, "bonus     0");
         Write(16, 10, "time");

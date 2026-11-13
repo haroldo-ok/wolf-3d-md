@@ -1,9 +1,9 @@
-# Wolfenstein 3D for the Sega Genesis / Mega Drive (shareware Episode 1)
+# Wolfenstein 3D for the Sega Genesis / Mega Drive (shareware and full version)
 
-A port of id Software's Wolfenstein 3D (shareware v1.4, Episode 1, 10 levels) to the Sega Genesis, written in C for SGDK (68000).
-All assets are converted from the original shareware data files by `tools/convert.py`: wall textures, sprites, maps, HUD, pics, fonts, menus, help/end texts, digitized sounds, AdLib sound effects and IMF music.
+A port of id Software's Wolfenstein 3D (v1.4) to the Sega Genesis, written in C for SGDK (68000). It builds from either the shareware data (`*.WL1`, Episode 1, 10 levels) or the retail data (`*.WL6`, six episodes, 60 levels).
+All assets are converted from the original data files by `tools/convert.py`: wall textures, sprites, maps, HUD, pics, fonts, menus, help/end texts, digitized sounds, AdLib sound effects and IMF music.
 
-ROM: `wolf3d-genesis.bin` (prebuilt, 4 MB; a build writes `out/rom.bin`), 32 KB battery SRAM declared in the header.
+ROM: `wolf3d-genesis.bin` is the prebuilt shareware ROM (4 MB); a build writes `out/rom.bin`. The full version is about 7 MB (see Full version below). 32 KB battery SRAM is declared in the header.
 
 ## Controls
 - D-pad: move forward/back, turn left/right
@@ -15,7 +15,7 @@ ROM: `wolf3d-genesis.bin` (prebuilt, 4 MB; a build writes `out/rom.bin`), 32 KB 
 - Rendering: 256x128 view, 128 two-pixel-wide rays, rendered to a 4bpp RAM buffer and DMA'd each frame (about 12-15 fps on an accurate emulator in high detail and 16-20 in low detail, depending on the scene; see Performance below). The Genesis has only 64 KB of RAM, so large data lives in ROM or is streamed.
 - Audio: Z80 PCM driver for digitized effects (the shareware has 21). AdLib effects are rendered offline with an OPL2 model into PCM. Music is the original IMF data converted into YM2612 (5 FM channels) + PSG tracks.
 - Save games: 3 slots in SRAM. High scores are stored there too.
-- Not included: demo playback, the registered episodes (not in the shareware data), and the 3-D view border effects of the PC version.
+- Not included: demo playback and the 3-D view border effects of the PC version.
 
 ## Performance
 Measured headless in Genesis Plus GX (accurate 68000/VDP timing), not yet on real hardware. Every optimisation below is pixel-exact in high detail: the picture on screen is identical, frame for frame, to the code it replaced.
@@ -52,12 +52,23 @@ The test hooks are compile-time options; a normal build contains none of them.
 - `-DVT_SEQ -DVT_DOORS` (`src/vt_doors.c`) swaps those views for ones that look at doors in every state of opening and at a sliding push wall, which the normal sequence hardly shows; compare two such builds the same way.
 - `-DVT_LOWDETAIL` starts in low detail. With `-DVT_EVENSUM` the checksums are taken over the picture low detail has to show (every odd ray replaced by the ray to its left), so a high and a low detail build made with it must give the same 240 checksums.
 - The weapon is not in the view buffer any more, so against a build from before that change compare with `-DVT_NOWEAPON` on both sides (checksums) and without it (the final screenshot, which includes the sprites). `-DVT_SEQ -DVT_WEAPON` shows the weapon frame given by the ROM byte `vt_weapon_sel`, to compare screenshots of all 20.
+- `-DVT_MAPS` shows every map for 100 frames and moves on (checks all levels load). `-DWOLF_TEST=4` plays the sounds listed in `-DWOLF_SNDS=...`; any other `WOLF_TEST` value starts a game at `-DWOLF_EP=<0..5>` `-DWOLF_MAP=<0..9>`.
 - `-DSTACKPAINT` fills the free stack with a marker at boot, so a RAM dump shows the deepest stack use.
 - `tools/harness` drives the Genesis Plus GX libretro core headless (scripted pad input, screenshots, RAM dumps); `tools/fps.sh`, `tools/run.sh` and `tools/prof.sh` use it.
 
+## Full version (WL6)
+`convert.py` looks at the extension of the files in the data directory (WL6 is preferred when both are present; a fourth argument `WL1` or `WL6` forces one). With WL6 data:
+- New Game first shows the episode list (six episodes, B goes back), then the difficulty. Each of the 60 levels has its own music, ceiling colour and par time, which are parsed from the original GPL source (`tools/srctab.py`), and each episode has its own victory text.
+- Maps are stored compressed (plane 0 as byte RLE, plane 1 as sparse rows) and unpacked per level; save games store the episode.
+- The 16-colour view palette is chosen per data set (`viewpal.json` for WL1, `viewpal_wl6.json` is generated on the first WL6 run).
+- The help text of the registered game refers to pictures that do not exist in the Genesis layout; only the three that map to real WL6 pictures are kept.
+- Sound: the digitized sounds and AdLib effects of the full game are 2.7 MB, which does not fit with everything else under the 3.5 MB (0x380000) the bank window leaves, so `convert.py` writes them to `src/gen/pcm.bin` and `make` appends that file with `tools/packrom.py` as 512 KB pages starting at 0x400000 (7 MB ROM, header end address and checksum patched). At start-up the game finds the pages through a banked window at 0x380000 (`SYS_setBank(7, n)`, marker "WOLF") or, if that is not present, linearly at 0x400000; with neither, sound effects are off. `WOLF_PCM_EXTERN=0` keeps the sounds inside the image (shareware default).
+- Tested in Genesis Plus GX only: all 60 levels load and render, the linear mapping plays every sound identically to the linked-in data. The banked window could not be tested, because that emulator's SSF header mode is silent even with the sounds linked in, and nothing has been run on real hardware. Whether a flash cart or emulator exposes the pages linearly (most do up to 8 MB) decides which path is used.
+- The retail data is commercial: do not commit or distribute `src/gen` or the ROM built from it.
+
 ## Building
-Needs SGDK 2.x and an m68k GCC toolchain, plus the shareware data files (`VSWAP.WL1`, `MAPHEAD.WL1`, `GAMEMAPS.WL1`, `AUDIOT.WL1`, `AUDIOHED.WL1`, `VGAGRAPH.WL1`, `VGAHEAD.WL1`, `VGADICT.WL1`) from https://archive.org/details/wolf3dsw .
-`make data` runs `tools/convert.py`; then `make EXTRA_FLAGS="-Isrc -g1"`. The sprite row and wall height tables depend only on the view geometry, and the weapon tiles are made from the converted sprites, and the doubled wall textures from the converted walls, so all three can be regenerated without the data files: `python3 tools/rtables.py .`, `python3 tools/weapon.py .` and `python3 tools/walls2.py .`
+Needs SGDK 2.x and an m68k GCC toolchain, plus the data files: either the full version (`VSWAP.WL6`, `MAPHEAD.WL6`, `GAMEMAPS.WL6`, `AUDIOT.WL6`, `AUDIOHED.WL6`, `VGAGRAPH.WL6`, `VGAHEAD.WL6`, `VGADICT.WL6`) or the shareware ones (`VSWAP.WL1`, `MAPHEAD.WL1`, `GAMEMAPS.WL1`, `AUDIOT.WL1`, `AUDIOHED.WL1`, `VGAGRAPH.WL1`, `VGAHEAD.WL1`, `VGADICT.WL1`) from https://archive.org/details/wolf3dsw .
+`make data WOLF_DATA=<dir with the data files> WOLF_SRC=<checkout of github.com/id-Software/wolf3d>` runs `tools/convert.py` (the source is needed for the sound names and the level tables); then `make EXTRA_FLAGS="-Isrc -g1"`. The sprite row and wall height tables depend only on the view geometry, and the weapon tiles are made from the converted sprites, and the doubled wall textures from the converted walls, so all three can be regenerated without the data files: `python3 tools/rtables.py .`, `python3 tools/weapon.py .` and `python3 tools/walls2.py .`
 
 ## Credits and licence
 Wolfenstein 3D is (c) id Software. The game data is the shareware release, whose licence permits limited, non-commercial redistribution as-is; the original game source (github.com/id-Software/wolf3d) is GPL. Made as a fan port with reference to haroldo-ok's Catacomb Abyss Mega Drive port. This is an unofficial port.

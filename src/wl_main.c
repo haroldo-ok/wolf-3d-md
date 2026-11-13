@@ -72,8 +72,30 @@ int main(bool hardReset)
     NewGame(gd_medium, 0);
     gamestate.mapon = 2;
     CheckHighScore(23456, 3);
+#elif defined(WOLF_TEST) && WOLF_TEST == 4
+    /* sound test: -DWOLF_SNDS=<sound numbers>; plays them one after the other, 260 frames apart */
+    {
+        static const u16 snds[] = { WOLF_SNDS };
+        u16 i;
+        for (i = 0; i < sizeof(snds) / sizeof(snds[0]); i++)
+        {
+            vid_wait(60);
+            SD_PlaySound(snds[i]);
+            vid_wait(200);
+        }
+        for (;;)
+            vid_frame();
+    }
 #elif defined(WOLF_TEST)
-    NewGame(gd_medium, 0);
+    /* test builds: -DWOLF_EP=<episode 0..5> -DWOLF_MAP=<floor 0..9> start there */
+#ifndef WOLF_EP
+#define WOLF_EP 0
+#endif
+#ifndef WOLF_MAP
+#define WOLF_MAP 0
+#endif
+    NewGame(gd_medium, WOLF_EP);
+    gamestate.mapon = WOLF_MAP;
     startgame = TRUE;
     GameLoop();
 #endif

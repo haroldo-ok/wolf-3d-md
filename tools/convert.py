@@ -21,6 +21,7 @@ import rtables as RTABLES
 import weapon as WEAPON
 import walls2 as WALLS2
 import config as C
+import srctab
 
 FLOOR_COLOR = 0x19
 DEFAULT_CEILING = 0x1d
@@ -35,7 +36,9 @@ def vdp(c3):
 # ----------------------------------------------------------------------------
 
 def build_view_palette(d, outdir):
-    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)), "viewpal.json")
+    # the cache is per data set: the full game has more textures than the shareware episode
+    cache = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "viewpal.json" if d.ext == "WL1" else "viewpal_%s.json" % d.ext.lower())
     if os.path.exists(cache):
         return [tuple(c) for c in json.load(open(cache))]
     allpal = d.pal8
@@ -221,37 +224,108 @@ def gen_sprites(d, m256, outdir):
 # ----------------------------------------------------------------------------
 # maps
 # ----------------------------------------------------------------------------
-CEILING_E1 = [0x1d] * 9 + [0xbf]
-PAR_E1 = [(1.5, "01:30"), (2, "02:00"), (2, "02:00"), (3.5, "03:30"), (3, "03:00"),
-          (3, "03:00"), (2.5, "02:30"), (2.5, "02:30"), (0, "??:??"), (0, "??:??")]
+
+def rle_bytes(data):
+    """byte RLE: c < 0x80 -> c+1 literal bytes follow; c >= 0x80 -> next byte repeated c-0x7E (2..129) times"""
+    out = bytearray()
+    i, n = 0, len(data)
+    lit = bytearray()
+
+    def flush():
+        while lit:
+            chunk = lit[:128]
+            del lit[:128]
+            out.append(len(chunk) - 1)
+            out.extend(chunk)
+    while i < n:
+        j = i
+        while j < n and data[j] == data[i] and j - i < 129:
+            j += 1
+        if j - i >= 3:
+            flush()
+            out.append(0x7E + (j - i))
+            out.append(data[i])
+            i = j
+        else:
+            lit.append(data[i])
+            i += 1
+    flush()
+    return bytes(out)
 
 
-def gen_maps(d, pal3, outdir):
-    t = "#include \"gen.h\"\n"
+def rle_check(enc, ref):
+    out = bytearray()
+    i = 0
+    while i < len(enc):
+        c = enc[i]
+        i += 1
+        if c < 0x80:
+            out += enc[i:i + c + 1]
+            i += c + 1
+        else:
+            out += bytes([enc[i]]) * (c - 0x7E)
+            i += 1
+    assert bytes(out) == bytes(ref)
+
+
+def sparse_plane(p1):
+    """object plane -> u16 row index (65 entries, in bytes) + (x, value) pairs, row by row"""
+    pairs = bytearray()
+    rows = []
+    for y in range(64):
+        rows.append(len(pairs))
+        for x in range(64):
+            v = p1[y * 64 + x]
+            if v >= 256:
+                # a handful of stray values in episode 2 maps; the original ignores them as well
+                # (nothing compares against a value that large)
+                continue
+            if v:
+                pairs.append(x)
+                pairs.append(v)
+    rows.append(len(pairs))
+    base = 65 * 2
+    idx = bytearray()
+    for r in rows:
+        idx += struct.pack(">H", base + r)
+    return bytes(idx) + bytes(pairs)
+
+
+def gen_maps(d, pal3, srcdir, outdir):
+    t = "#include \"gen.h\"\n#include \"audionames.h\"\n"
     nm = len(d.maps)
+    total = 0
     for i, m in enumerate(d.maps):
         p0 = m["planes"][0]
         p1 = m["planes"][1]
         assert max(p0) < 256, max(p0)
-        t += c_bytes("map%d_p0" % i, p0)
-        t += c_words("map%d_p1" % i, p1, "u16", per_line=16)
+        assert m["width"] == 64 and m["height"] == 64
+        e0 = rle_bytes(bytes(p0))
+        rle_check(e0, bytes(p0))
+        e1 = sparse_plane(p1)
+        total += len(e0) + len(e1)
+        t += c_bytes("map%d_p0" % i, e0)
+        t += c_bytes("map%d_p1" % i, e1, align=2)
+    songs = srctab.songs(srcdir)
+    ceil = srctab.ceilings(srcdir)
+    par = srctab.par_times(srcdir)
     t += "const mapinfo_t mapinfo[%d] = {\n" % nm
     allpal = d.pal8
     for i, m in enumerate(d.maps):
-        cc = CEILING_E1[i]
-        c3 = snap(allpal[cc])
-        t += "{map%d_p0,map%d_p1,\"%s\",0x%04X,%d},\n" % (i, i, m["name"], vdp(c3), int(PAR_E1[i][0] * 60 * 70))
+        c3 = snap(allpal[ceil[i]])
+        t += "{map%d_p0,map%d_p1,\"%s\",0x%04X,%d,%s},\n" % (i, i, m["name"], vdp(c3), int(par[i][0] * 60 * 70), songs[i])
     t += "};\n"
     write(os.path.join(outdir, "src/gen/maps.c"), t)
+    return total
 
 
 def gen_header(d, pal3, outdir):
     h = "#ifndef GEN_H\n#define GEN_H\n#include \"wl_types.h\"\n"
     h += "#define VIEWW %d\n#define VIEWH %d\n" % (C.VIEWW, C.VIEWH)
-    h += "#define NUMWALLPAGES %d\n#define NUMSPRITES %d\n#define NUMMAPS %d\n" % (d.num_walls(), d.num_sprites(), len(d.maps))
+    h += "#define NUMWALLPAGES %d\n#define NUMSPRITES %d\n#define NUMMAPS %d\n#define NUMEPISODES %d\n" % (d.num_walls(), d.num_sprites(), len(d.maps), len(d.maps) // 10)
     h += "#define FLOOR_PALIDX 0\n#define CEIL_PALIDX 1\n"
     h += "typedef struct { u32 data_ofs; u16 colidx; u8 left, right; } sprhdr_t;\n"
-    h += "typedef struct { const u8 *p0; const u16 *p1; const char *name; u16 ceilcolor; s32 partics; } mapinfo_t;\n"
+    h += "typedef struct { const u8 *p0; const u8 *p1; const char *name; u16 ceilcolor; s32 partics; s16 song; } mapinfo_t;\n"
     h += "extern const s32 sintable[%d];\nextern const s32 finetangent[%d];\n" % (C.ANGLES + C.ANGLES // 4, C.FINEANGLES // 4)
     h += "extern const s16 pixelangle[%d];\nextern const u8 rndtable[256];\nextern const u32 recip_step[%d];\n" % (C.VIEWW // 2, 513)
     h += "extern const s32 proj_scale, proj_heightnumerator;\nextern const u16 scaler_code[];\n"
@@ -277,11 +351,26 @@ def gen_sprnames(srcdir, outdir):
     write(os.path.join(outdir, "src/gen/sprnames.h"), t)
 
 
-def gen_namehdrs(srcdir, outdir):
-    # audio: v1.4 data matches AUDIOWL6.H (87 sounds, 288 chunks)
-    t = open(os.path.join(srcdir, "WOLFSRC", "AUDIOWL6.H"), encoding="latin-1").read()
-    write(os.path.join(outdir, "src/gen", "audionames.h"), "#ifndef WL_AUDIONAMES_H\n#define WL_AUDIONAMES_H\n%s\n#endif\n" % t)
-    # graphics: v1.4 shareware pictable = repo WL1 header + 8 extra pics
+def gfx_layout(d, srcdir):
+    """Picture names and chunk numbers of this data set.
+
+    The full game (WL6) follows GFXV_WL6.H.  The shareware v1.4 data has its own, longer layout:
+    GFXV_WL1.H of the repository plus eight more pictures, which is rebuilt here."""
+    if d.ext == "WL6":
+        h = open(os.path.join(srcdir, "WOLFSRC", "GFXV_WL6.H"), encoding="latin-1").read()
+        e = h[h.index("typedef enum"):h.index("graphicnums")]
+        chunk = None
+        names = []
+        out = []
+        for m in re.finditer(r"^\s*([A-Z0-9_]+)\s*(?:=\s*(\d+))?\s*,", e, re.M):
+            n, v = m.group(1), m.group(2)
+            chunk = int(v) if v else chunk + 1
+            out.append((n, chunk))
+        pics = [(n, c) for n, c in out if c < 135]
+        assert [c for n, c in pics] == list(range(3, 3 + len(pics)))
+        ends = {n: c for n, c in out if n.startswith("T_")}
+        return dict(pics=pics, numpics=len(pics), tile8=3 + len(pics), help=ends["T_HELPART"],
+                    ends=[ends["T_ENDART%d" % i] for i in range(1, 7)])
     h = open(os.path.join(srcdir, "WOLFSRC", "GFXV_WL1.H"), encoding="latin-1").read()
     e = h[h.index("typedef enum"):h.index("}", h.index("typedef enum"))]
     names = ["H_BJPIC"] + re.findall(r"^\s*([A-Z0-9_]+),", e, re.M)
@@ -296,13 +385,24 @@ def gen_namehdrs(srcdir, outdir):
         if n == "L_EXPOINTPIC":
             out.append("L_APOSTROPHEPIC")
     assert len(out) == 144, len(out)
+    return dict(pics=[(n, 3 + i) for i, n in enumerate(out)], numpics=144, tile8=147, help=150, ends=[155])
+
+
+def gen_namehdrs(d, srcdir, outdir):
+    # audio: v1.4 data matches AUDIOWL6.H (87 sounds, 288 chunks)
+    t = open(os.path.join(srcdir, "WOLFSRC", "AUDIOWL6.H"), encoding="latin-1").read()
+    write(os.path.join(outdir, "src/gen", "audionames.h"), "#ifndef WL_AUDIONAMES_H\n#define WL_AUDIONAMES_H\n%s\n#endif\n" % t)
+    lay = gfx_layout(d, srcdir)
     g = "#ifndef WL_GFXNAMES_H\n#define WL_GFXNAMES_H\n"
-    for i, n in enumerate(out):
-        g += "#define %s %d\n" % (n, 3 + i)
-    g += "#define STARTPICS 3\n#define NUMPICS 144\n#define STARTTILE8 147\n#define NUMGFXPICS 144\n#endif\n"
+    for n, c in lay["pics"]:
+        g += "#define %s %d\n" % (n, c)
+    g += "#define STARTPICS 3\n#define NUMPICS %d\n#define STARTTILE8 %d\n#define NUMGFXPICS %d\n#endif\n" % (
+        lay["numpics"], lay["tile8"], lay["numpics"])
     write(os.path.join(outdir, "src/gen", "gfxnames.h"), g)
-    print("gfx pics:", len(out), "STATUSBAR", out.index("STATUSBARPIC") + 3, "N_0", out.index("N_0PIC") + 3, "PAUSED", out.index("PAUSEDPIC") + 3)
-    return [(n, 3 + i) for i, n in enumerate(out)]
+    names = [n for n, c in lay["pics"]]
+    print("gfx pics:", len(names), "STATUSBAR", names.index("STATUSBARPIC") + 3, "N_0", names.index("N_0PIC") + 3,
+          "PAUSED", names.index("PAUSEDPIC") + 3)
+    return lay
 
 
 def gen_soundtab(srcdir, outdir):
@@ -317,9 +417,20 @@ def gen_soundtab(srcdir, outdir):
     write(os.path.join(outdir, "src/gen/soundtab.c"), out)
 
 
+def detect_ext(datadir):
+    for ext in ("WL6", "WL1"):
+        if os.path.exists(os.path.join(datadir, "VSWAP." + ext)):
+            return ext
+    raise SystemExit("no VSWAP.WL6 or VSWAP.WL1 in " + datadir)
+
+
 def main():
+    if len(sys.argv) < 4:
+        raise SystemExit("usage: convert.py DATADIR WOLFSRCDIR OUTDIR [WL1|WL6]")
     datadir, srcdir, outdir = sys.argv[1:4]
-    d = Data(datadir, srcdir)
+    ext = sys.argv[4].upper() if len(sys.argv) > 4 else detect_ext(datadir)
+    print("data set:", ext)
+    d = Data(datadir, srcdir, ext)
     pal3 = build_view_palette(d, outdir)
     m256 = map256(d, pal3)
     print("view palette:", pal3)
@@ -327,17 +438,19 @@ def main():
     print("tables:", gen_tables(d, outdir))
     print("walls bytes:", gen_walls(d, m256, outdir))
     print("sprites bytes (data, colofs):", gen_sprites(d, m256, outdir))
-    gen_maps(d, pal3, outdir)
+    print("maps bytes:", gen_maps(d, pal3, srcdir, outdir))
     gen_sprnames(srcdir, outdir)
-    nm = gen_namehdrs(srcdir, outdir)
+    lay = gen_namehdrs(d, srcdir, outdir)
     gen_soundtab(srcdir, outdir)
-    print('pics bytes:', PICS.gen_pics(d, nm, pal3, outdir))
-    TEXTS.gen_texts(d, outdir)
+    print('pics bytes:', PICS.gen_pics(d, lay["pics"], pal3, outdir))
+    TEXTS.gen_texts(d, lay, outdir)
     print("scalers (bytes, variants):", SCALERS.gen_scalers(outdir))
     print("renderer tables bytes:", RTABLES.gen_rtables(outdir))
     print("doubled wall bytes:", WALLS2.gen_walls2(outdir))
     print("weapon sprites (tile bytes, most tiles, most sprites):", WEAPON.gen_weapon(outdir))
-    print('audio (pcm bytes, music bytes, digi sounds):', AUDIO.gen_audio(d, srcdir, outdir))
+    # the full game's sounds do not fit in the first 4 MB with everything else: they go to extra ROM pages
+    external = os.environ.get("WOLF_PCM_EXTERN", "1" if d.ext == "WL6" else "0") == "1"
+    print('audio (pcm bytes, music bytes, digi sounds):', AUDIO.gen_audio(d, srcdir, outdir, external))
     fh = PICS.gen_fonts(d, outdir)
     open(os.path.join(outdir, 'src/gen/pics.h'), 'a').write('')
 

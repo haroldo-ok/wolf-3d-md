@@ -92,15 +92,35 @@ def cstr(s):
     return "".join(out)
 
 
-def gen_texts(d, outdir):
-    help_t = d.vga_chunk(150).decode("latin1").replace("\r", "")
-    end_t = d.vga_chunk(155).decode("latin1").replace("\r", "")
+# The help text of the full game (VGAGRAPH.WL6) was written for the picture numbers of the shareware data;
+# only these still point at the right picture in the full game's layout: shareware number -> WL6 number
+HELP_PIC_REMAP_WL6 = {3: 3, 4: 4, 11: 5}
+
+
+def remap_help_pics(t):
+    def fix(m):
+        n = int(m.group(3))
+        if n not in HELP_PIC_REMAP_WL6:
+            return ""
+        return "^G%s,%s,%d\n" % (m.group(1), m.group(2), HELP_PIC_REMAP_WL6[n])
+    return re.sub(r"^\^G(\d+),(\d+),(\d+)\n", fix, t, flags=re.M)
+
+
+def gen_texts(d, lay, outdir):
+    help_t = d.vga_chunk(lay["help"]).decode("latin1").replace("\r", "")
     help_t = patch_help(help_t)
-    # page 1 does not start with a numbered page marker in the original layout engine's eyes: fine, "^PAGE n" starts with ^P
-    def lit(name, t):
-        lines = ['const char %s[] =' % name]
+    if d.ext == "WL6":
+        help_t = remap_help_pics(help_t)
+
+    def lit(name, t, static=True):
+        lines = ['%sconst char %s[] =' % ("static " if static else "", name)]
         for ln in t.split("\n"):
             lines.append('"%s\\n"' % cstr(ln))
         lines[-1] += ";"
         return "\n".join(lines) + "\n"
-    write(os.path.join(outdir, "src/gen", "texts.c"), lit("help_text", help_t) + lit("end_text", end_t))
+    out = lit("help_text", help_t, False)
+    ends = [d.vga_chunk(c).decode("latin1").replace("\r", "") for c in lay["ends"]]
+    for i, e in enumerate(ends):
+        out += lit("end_str%d" % i, e)
+    out += "const char *const end_texts[%d] = {%s};\n" % (len(ends), ",".join("end_str%d" % i for i in range(len(ends))))
+    write(os.path.join(outdir, "src/gen", "texts.c"), out)

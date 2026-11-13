@@ -19,7 +19,7 @@ from cgen import c_bytes, c_words, write
 import config as C
 
 NFRAMES = 20                    # SPR_KNIFEREADY .. SPR_CHAINATK4
-ZERO_IDX = 2
+ZERO_IDX = 2                    # default; gen_weapon picks an entry no weapon uses (depends on the view palette)
 MAXTILES = 152                  # per frame; two banks of this many fit below the planes
 VIEW_CX0 = (40 - C.VIEWW // 8) // 2
 VIEW_CY0 = (23 - C.VIEWH // 8) // 2
@@ -59,7 +59,14 @@ def frame_pixels(hdr, colofs, data, shape):
 
 
 def gen_weapon(outdir):
+    global ZERO_IDX
     hdr, colofs, data, first = load(outdir)
+    used = set()
+    for f in range(NFRAMES):
+        used |= set(frame_pixels(hdr, colofs, data, first + f).values())
+    free = [i for i in range(2, 16) if i not in used]
+    assert free, "every view palette entry is used by a weapon: no entry left for transparent colour 0"
+    ZERO_IDX = 2 if 2 in free else free[0]
     tiles = bytearray()
     sat = []
     frames = []

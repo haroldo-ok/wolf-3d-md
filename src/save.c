@@ -223,7 +223,7 @@ boolean Save_Read(s16 slot)
     rmem(rk, 8); rmem(rs, 8); rmem(rt, 8);
     rmem(rtm, sizeof(rtm));
     for (i = 0; i < 5; i++) rmem(&pw[i], 2);
-    if (overflow || gs.mapon < 0 || gs.mapon > 9)
+    if (overflow || gs.mapon < 0 || gs.mapon > 9 || gs.episode < 0 || gs.episode >= NUMEPISODES)
     {
         SRAM_disable();
         return FALSE;

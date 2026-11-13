@@ -12,7 +12,7 @@
 #include <string.h>
 
 extern const char help_text[];
-extern const char end_text[];
+extern const char *const end_texts[];
 
 /* ------------------------------------------------------------ colours */
 
@@ -182,6 +182,9 @@ static boolean ui_confirm(const char *str)
 typedef struct { const char *s; u8 active; } mitem_t;
 typedef struct { s16 x, y; u8 amount; s8 curpos; s16 indent; s16 erasew; } minfo_t;
 
+/* vertical distance of the menu items: 13 pixels, 26 for the episode list */
+static s16 menu_step = 13;
+
 static u8 item_color(u8 active, boolean hl)
 {
     switch (active)
@@ -194,11 +197,26 @@ static u8 item_color(u8 active, boolean hl)
 
 static void draw_item(const minfo_t *mi, const mitem_t *it, s16 i, boolean hl)
 {
-    s16 y = mi->y + i * 13;
+    s16 y = mi->y + i * menu_step;
     s16 x = mi->x + mi->indent;
-    if (!it[i].s[0]) return;
-    ui_bar(x - 1, y, mi->erasew, 13, K[K_BKGD]);
-    ui_text(1, x, y, it[i].s, item_color(it[i].active, hl));
+    const char *s = it[i].s, *nl;
+    u8 color = item_color(it[i].active, hl);
+    if (!s[0]) return;
+    ui_bar(x - 1, y, mi->erasew, menu_step, K[K_BKGD]);
+    nl = strchr(s, '\n');
+    if (nl)
+    {
+        /* two lines: the second one is drawn from the part after the line break */
+        char line[32];
+        s16 n = nl - s;
+        if (n > 31) n = 31;
+        memcpy(line, s, n);
+        line[n] = 0;
+        ui_text(1, x, y, line, color);
+        ui_text(1, x, y + 13, nl + 1, color);
+    }
+    else
+        ui_text(1, x, y, s, color);
 }
 
 static void draw_menu(const minfo_t *mi, const mitem_t *it)
@@ -211,7 +229,7 @@ static void draw_menu(const minfo_t *mi, const mitem_t *it)
 static void draw_gun(const minfo_t *mi, s16 which, boolean anim)
 {
     s16 x = mi->x & ~7;
-    s16 y = mi->y + which * 13 - 2;
+    s16 y = mi->y + which * menu_step - 2;
     drawpic(x, y, anim ? C_CURSOR2PIC : C_CURSOR1PIC);
 }
 
@@ -224,7 +242,7 @@ static void menu_prepare(minfo_t *mi, mitem_t *it, void (*routine)(s16))
         which = (which + 1) % mi->amount;
     mi->curpos = which;
     draw_menu(mi, it);
-    ui_bar(x - 1, mi->y - 2, 25, mi->amount * 13 + 2, K[K_BKGD]);
+    ui_bar(x - 1, mi->y - 2, 25, mi->amount * menu_step + 2, K[K_BKGD]);
     draw_gun(mi, which, 0);
     if (routine) routine(which);
 }
@@ -261,7 +279,7 @@ static s16 handle_menu(minfo_t *mi, mitem_t *it, void (*routine)(s16))
         if (dir)
         {
             s16 n = which;
-            ui_bar(x - 1, mi->y + which * 13 - 2, 25, 18, K[K_BKGD]);
+            ui_bar(x - 1, mi->y + which * menu_step - 2, 25, 18, K[K_BKGD]);
             draw_item(mi, it, which, FALSE);
             for (i = 0; i < mi->amount; i++)
             {
@@ -359,30 +377,80 @@ static void draw_new_game(void)
     ui_window(NM_X - 5, NM_Y - 10, NM_W, NM_H);
 }
 
+/* episode list (only when the data has more than one episode) */
+#define NE_X    10
+#define NE_Y    23
+#define NE_W    (320 - NE_X * 2)
+#define NE_H    (200 - NE_Y * 2)
+
+static mitem_t EpMenu[6] =
+{
+    {"Episode 1\nEscape from Wolfenstein", 1},
+    {"Episode 2\nOperation: Eisenfaust", 1},
+    {"Episode 3\nDie, Fuhrer, Die!", 1},
+    {"Episode 4\nA Dark Secret", 1},
+    {"Episode 5\nTrail of the Madman", 1},
+    {"Episode 6\nConfrontation", 1},
+};
+static minfo_t EpItems = { NE_X, NE_Y, 6, 0, 88, 200 };
+
+static void draw_episodes(void)
+{
+    static const char title[] = "Which episode to play?";
+    s16 i;
+    ui_clear();
+    drawpic(112, 184, C_MOUSELBACKPIC);
+    ui_window(NE_X - 4, NE_Y - 4, NE_W + 8, NE_H + 8);
+    ui_text(1, 160 - txt_width(1, title) / 2, 2, title, K[K_READH]);
+    for (i = 0; i < 6; i++)
+        drawpic(NE_X + 32, NE_Y + i * 26, C_EPISODE1PIC + i);
+}
+
 static boolean cp_new_game(void)
 {
-    s16 which;
+    s16 which, episode = 0;
+    boolean shown = FALSE, asked = FALSE;
+
     ui_open(PG_MENU, ui_kmenu);
-    draw_new_game();
-    if (ingame)
+    for (;;)
     {
-        ui_show();
-        if (!ui_confirm("You are currently in a game.\nContinuing will erase\nold game.  Ok?  (A/B)"))
-            return FALSE;
+        if (NUMEPISODES > 1)
+        {
+            draw_episodes();
+            menu_step = 26;
+            menu_prepare(&EpItems, EpMenu, NULL);
+            if (shown) vid_update();
+            else { ui_show(); shown = TRUE; }
+            episode = handle_menu(&EpItems, EpMenu, NULL);
+            menu_step = 13;
+            if (episode < 0)
+                return FALSE;
+        }
+        if (ingame && !asked)
+        {
+            if (!shown)
+            {
+                draw_new_game();
+                ui_show();
+                shown = TRUE;
+            }
+            if (!ui_confirm("You are currently in a game.\nContinuing will erase\nold game.  Ok?  (A/B)"))
+                return FALSE;
+            asked = TRUE;
+        }
         draw_new_game();
         menu_prepare(&NewItems, NewMenu, new_game_face);
-        vid_update();
+        if (shown) vid_update();
+        else { ui_show(); shown = TRUE; }
+        which = handle_menu(&NewItems, NewMenu, new_game_face);
+        if (which >= 0)
+            break;
+        if (NUMEPISODES == 1)
+            return FALSE;
+        /* B: back to the episode list */
     }
-    else
-    {
-        menu_prepare(&NewItems, NewMenu, new_game_face);
-        ui_show();
-    }
-    which = handle_menu(&NewItems, NewMenu, new_game_face);
-    if (which < 0)
-        return FALSE;
     newgame_difficulty = which;
-    NewGame(which, 0);
+    NewGame(which, episode);
     startgame = TRUE;
     return TRUE;
 }
@@ -893,7 +961,7 @@ void HelpScreens(void)
 
 void EndText(void)
 {
-    show_article(end_text);
+    show_article(end_texts[gamestate.episode < NUMEPISODES ? gamestate.episode : 0]);
 }
 
 /* --------------------------------------------------------- control panel */

@@ -13,6 +13,54 @@ boolean SoundOn = TRUE, MusicOn = TRUE;
 
 /* ---------------------------------------------------------------- effects */
 
+#if PCM_EXTERN
+/* The sound data lives behind the first 4 MB of the ROM (pcm.bin, appended by tools/packrom.py), in
+ * 512 KB pages 8 and up.  A cartridge with the SSF mapper shows one page at a time in the window at
+ * 0x380000 (region 7), which nothing else uses; emulators that map larger ROMs linearly simply have the
+ * data at 0x400000.  SD_Init finds out which of the two applies by looking for the marker. */
+#define PCM_PAGE_BITS   19
+#define PCM_FIRST_PAGE  8
+#define PCM_WINDOW      0x380000
+#define PCM_LINEAR      0x400000
+
+static u8 pcm_mode;                 /* 0 = not found (no digitised/AdLib effects), 1 = window, 2 = linear */
+static s16 pcm_page = -1;
+
+static const u8 *pcm_ptr(u32 ofs)
+{
+    if (pcm_mode == 1)
+    {
+        s16 page = ofs >> PCM_PAGE_BITS;
+        if (page != pcm_page)
+        {
+            SND_PCM4_stopPlay(SOUND_PCM_CH1);       /* the driver must not read the old page while it is swapped out */
+            SYS_setBank(7, PCM_FIRST_PAGE + page);
+            pcm_page = page;
+        }
+        return (const u8 *)(PCM_WINDOW + (ofs & ((1UL << PCM_PAGE_BITS) - 1)));
+    }
+    return (const u8 *)(PCM_LINEAR + ofs);
+}
+
+static void pcm_detect(void)
+{
+    pcm_mode = 0;
+    SYS_setBank(7, PCM_FIRST_PAGE);
+    pcm_page = 0;
+    if (*(vu32 *)PCM_WINDOW == pcm_marker)
+        pcm_mode = 1;
+    else
+    {
+        SYS_setBank(7, 7);
+        pcm_page = -1;
+        if (*(vu32 *)PCM_LINEAR == pcm_marker)
+            pcm_mode = 2;
+    }
+}
+#else
+#define pcm_ptr(ofs)    (pcm_data + (ofs))
+#endif
+
 static s16 sfx_cur = -1;
 static u16 sfx_prio;
 static u32 sfx_end;
@@ -44,20 +92,23 @@ boolean SD_PlaySound(u16 sound)
 {
     const snd_t *t;
     const u8 *data;
-    u32 len;
+    u32 len, ofs;
     boolean positioned = pos_next;
 
     pos_next = FALSE;
     if (sound >= NUMSOUNDS_G) return FALSE;
     t = &snd_tab[sound];
+#if PCM_EXTERN
+    if (!pcm_mode) return FALSE;
+#endif
     if (DigiMode != sds_Off && t->digi_len)
     {
-        data = pcm_data + t->digi_ofs;
+        ofs = t->digi_ofs;
         len = t->digi_len;
     }
     else if (SoundOn)
     {
-        data = pcm_data + t->adlib_ofs;
+        ofs = t->adlib_ofs;
         len = t->adlib_len;
     }
     else
@@ -68,6 +119,7 @@ boolean SD_PlaySound(u16 sound)
 
     sfx_vol = positioned ? pos_volume(pos_l, pos_r) : 15;
     SYS_disableInts();
+    data = pcm_ptr(ofs);        /* may switch the ROM page: only now that the old sound is being replaced */
     SND_PCM4_startPlay(data, len, SOUND_PCM_CH1, FALSE);
     SND_PCM4_setVolume(SOUND_PCM_CH1, sfx_vol);
     SYS_enableInts();
@@ -239,6 +291,9 @@ void snd_tick(void)
 
 void SD_Init(void)
 {
+#if PCM_EXTERN
+    pcm_detect();
+#endif
     SND_PCM4_loadDriver(TRUE);
     sfx_cur = -1;
     mus_on = FALSE;

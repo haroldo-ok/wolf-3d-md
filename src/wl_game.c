@@ -11,7 +11,7 @@
 
 gametype gamestate;
 u8 mapplane0[MAPSIZE * MAPSIZE];
-const u16 *mapplane1;
+const u8 *mapplane1;
 
 static const s16 ElevatorBackTo[6] = { 1, 1, 7, 3, 5, 3 };
 
@@ -103,18 +103,51 @@ static boolean ScanEnemy(u16 tile, s16 x, s16 y)
     return FALSE;
 }
 
+/* object plane lookup: u16 row offsets (65, big endian, in bytes from the start), then (x, value) pairs */
+u16 MapSpot1(s16 x, s16 y)
+{
+    const u16 *rows = (const u16 *)mapplane1;
+    const u8 *p = mapplane1 + rows[y], *e = mapplane1 + rows[y + 1];
+    for (; p < e; p += 2)
+        if (p[0] == x)
+            return p[1];
+    return 0;
+}
+
+/* the ground plane is stored run length encoded: c < 0x80 = c+1 literal bytes, else next byte repeated c-0x7E times */
+static void UnpackPlane0(const u8 *s, u8 *d)
+{
+    u8 *e = d + MAPSIZE * MAPSIZE;
+    while (d < e)
+    {
+        u16 c = *s++;
+        if (c < 0x80)
+        {
+            c++;
+            do *d++ = *s++; while (--c);
+        }
+        else
+        {
+            u8 v = *s++;
+            c -= 0x7E;
+            do *d++ = v; while (--c);
+        }
+    }
+}
+
 void ScanInfoPlane(void)
 {
     s16 x, y;
     u16 tile;
-    const u16 *start = mapplane1;
+    const u16 *rows = (const u16 *)mapplane1;
 
     for (y = 0; y < MAPSIZE; y++)
-        for (x = 0; x < MAPSIZE; x++)
+    {
+        const u8 *p = mapplane1 + rows[y], *e = mapplane1 + rows[y + 1];
+        for (; p < e; p += 2)
         {
-            tile = *start++;
-            if (!tile)
-                continue;
+            x = p[0];
+            tile = p[1];
 
             if (tile >= 19 && tile <= 22)
                 SpawnPlayer(x, y, NORTH + tile - 19);
@@ -139,13 +172,14 @@ void ScanInfoPlane(void)
             else
                 ScanEnemy(tile, x, y);
         }
+    }
 }
 
 void SetupGameLevel(void)
 {
     s16 x, y, i;
     u16 tile, spot;
-    const mapinfo_t *mi = &mapinfo[gamestate.mapon];
+    const mapinfo_t *mi = &mapinfo[MAPINDEX()];
 
     if (!loadedgame)
     {
@@ -160,7 +194,7 @@ void SetupGameLevel(void)
 
     US_InitRndT(TRUE);
 
-    memcpy(mapplane0, mi->p0, MAPSIZE * MAPSIZE);
+    UnpackPlane0(mi->p0, mapplane0);
     mapplane1 = mi->p1;
     R_SetLevelColors(mi->ceilcolor);
 
@@ -398,6 +432,37 @@ restartgame:
         else
             died = FALSE;
 
+#ifdef VT_MAPS
+        /* test hook: show every map of the data for a moment, one after the other */
+        {
+            static s16 vt_map;
+            static u32 vt_t0;
+            s16 k;
+            if (!vt_t0)
+                vt_t0 = vid_frames;
+            DrawLevel();
+            vid_black();
+            ThreeDRefresh();
+            ThreeDRefresh();
+            vid_wait_idle();
+            FadeInLevel();
+            for (k = 0; k < 12; k++)
+            {
+                ThreeDRefresh();
+                vid_frame();
+            }
+            StopMusic();
+            while ((vid_frames - vt_t0) % 100)      /* every map takes exactly 100 frames */
+                vid_frame();
+            if (++vt_map >= NUMMAPS)
+                for (;;)
+                    vid_frame();
+            gamestate.episode = vt_map / 10;
+            gamestate.mapon = vt_map % 10;
+            died = TRUE;                    /* skips "Get Psyched" */
+            continue;
+        }
+#endif
         fizzlein = TRUE;
         DrawLevel();
 

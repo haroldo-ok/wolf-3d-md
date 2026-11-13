@@ -479,7 +479,13 @@ def pad256(b):
     return b + bytes((-len(b)) % 256)
 
 
-def gen_audio(d, srcdir, outdir):
+PAGE = 0x80000                  # the ROM mapper's page size: no sample may cross one
+PCM_MAGIC = b"WOLFPCM1"
+
+
+def gen_audio(d, srcdir, outdir, external=False):
+    """external: the sound data goes to OUTDIR/src/gen/pcm.bin, which tools/packrom.py appends to the ROM
+    behind the first 4 MB (pages 8 and up of the SSF mapper), instead of being linked in as pcm_data."""
     dm = digimap(srcdir)
     avail = set()
     for i in range(len(d.digi_info())):
@@ -491,21 +497,29 @@ def gen_audio(d, srcdir, outdir):
     dm = {k: v for k, v in dm.items() if v in avail}
     blob = bytearray()
     entries = []
+    if external:
+        blob += PCM_MAGIC.ljust(256, b"\0")        # marker the game looks for to find out how the pages are mapped
+
+    def put(data):
+        """append a sample, never across a page boundary; returns its offset"""
+        if external and (len(blob) % PAGE) + len(data) > PAGE:
+            blob.extend(bytes(-len(blob) % PAGE))
+        o = len(blob)
+        blob.extend(data)
+        return o
     adl = render_all_adlib(d)
     peak = max(float(np.max(np.abs(y))) for y, _ in adl if len(y))
     for s in range(NUMSOUNDS):
         y, prio = adl[s]
         pcm = np.clip(np.round(y / peak * 100.0), -128, 127).astype(np.int8).tobytes() if len(y) else b""
         pcm = pad256(pcm if pcm else b"\0")
-        aofs = len(blob)
-        blob += pcm
+        aofs = put(pcm)
         alen = len(pcm)
         dofs = dlen = 0
         if s in dm:
             raw = d.digi_sound(dm[s])
             dpcm = pad256(resample_digi(raw).tobytes())
-            dofs = len(blob)
-            blob += dpcm
+            dofs = put(dpcm)
             dlen = len(dpcm)
         entries.append((aofs, alen, dofs, dlen, prio))
     # music
@@ -518,7 +532,16 @@ def gen_audio(d, srcdir, outdir):
         mus += st
     # C source
     out = ['#include "audio.h"\n']
-    out.append(c_bytes("pcm_data", bytes(blob), "u8", True, 256))
+    if external:
+        blob.extend(bytes(-len(blob) % PAGE))
+        with open(os.path.join(outdir, "src/gen", "pcm.bin"), "wb") as f:
+            f.write(bytes(blob))
+        out.append("const u32 pcm_marker = 0x%08X;\n" % struct.unpack(">I", PCM_MAGIC[:4])[0])
+    else:
+        out.append(c_bytes("pcm_data", bytes(blob), "u8", True, 256))
+        stale = os.path.join(outdir, "src/gen", "pcm.bin")
+        if os.path.exists(stale):
+            os.remove(stale)            # left over from a conversion of the full game
     out.append("const snd_t snd_tab[%d] = {\n" % NUMSOUNDS)
     out.append(",\n".join("{%dul,%dul,%dul,%dul,%d}" % e for e in entries))
     out.append("};\n")
@@ -530,7 +553,9 @@ def gen_audio(d, srcdir, outdir):
     h = ("#ifndef AUDIO_H\n#define AUDIO_H\n#include \"../wl_types.h\"\n"
          "typedef struct { u32 adlib_ofs, adlib_len, digi_ofs, digi_len; u16 priority; } snd_t;\n"
          "typedef struct { u32 ofs, len; } mus_t;\n"
-         "extern const u8 pcm_data[];\nextern const snd_t snd_tab[%d];\nextern const u8 music_data[];\nextern const mus_t music_tab[%d];\n"
-         "#define PCM_RATE_HZ 16000\n#define NUMSOUNDS_G %d\n#define NUMSONGS_G %d\n#endif\n") % (NUMSOUNDS, NUMSONGS, NUMSOUNDS, NUMSONGS)
+         "%s" "extern const snd_t snd_tab[%d];\nextern const u8 music_data[];\nextern const mus_t music_tab[%d];\n"
+         "#define PCM_RATE_HZ 16000\n#define NUMSOUNDS_G %d\n#define NUMSONGS_G %d\n#define PCM_EXTERN %d\n#endif\n") % (
+        "extern const u32 pcm_marker;\n" if external else "extern const u8 pcm_data[];\n",
+        NUMSOUNDS, NUMSONGS, NUMSOUNDS, NUMSONGS, 1 if external else 0)
     write(os.path.join(outdir, "src/gen", "audio.h"), h)
     return len(blob), len(mus), sum(1 for e in entries if e[3])

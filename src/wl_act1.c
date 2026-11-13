@@ -78,7 +78,7 @@ u16 InfoPlane(s16 x, s16 y)
     for (i = 0; i < info_clr_n; i++)
         if (info_clr_x[i] == x && info_clr_y[i] == y)
             return 0;
-    return MAPSPOT1(x, y);
+    return MapSpot1(x, y);
 }
 
 static void ClearInfo(s16 x, s16 y)

@@ -117,10 +117,11 @@ def gen_pics(d, names, view_pal, outdir):
         entries[c] = (w // 8, h, g, ofs)
     out.append(c_bytes("pic_data", bytes(blob), "u8", True, 2))
     tab = []
-    for c in range(3, 147):
+    npics = len(names)
+    for c in range(3, 3 + npics):
         e = entries.get(c, (0, 0, 0, 0))
         tab.append("{%d,%d,%d,%d}" % (e[0], e[1], e[2], e[3]))
-    out.append("const pic_t pic_tab[%d] = {%s};\n" % (144, ",".join(tab)))
+    out.append("const pic_t pic_tab[%d] = {%s};\n" % (npics, ",".join(tab)))
     out.append("const u16 pic_group_pal[%d][16] = {\n%s};\n" % (len(GROUP_NAMES), ",\n".join(
         "{" + ",".join("0x%04X" % vdp(c) for c in p) + "}" for p in gpal)))
     lab7 = palette_lab(gpal[7])
@@ -133,7 +134,7 @@ def gen_pics(d, names, view_pal, outdir):
     write(os.path.join(outdir, "src/gen/pics.c"), "".join(out))
     # palette index of the text colours inside the menu-like groups
     h = "#ifndef PICS_H\n#define PICS_H\n#include \"../wl_types.h\"\ntypedef struct { u16 w8; u16 h; u16 group; u32 ofs; } pic_t;\n"
-    h += "extern const u8 pic_data[];\nextern const pic_t pic_tab[144];\nextern const u16 border_color;\nextern const u16 pic_group_pal[%d][16];\n" % len(GROUP_NAMES)
+    h += "extern const u8 pic_data[];\nextern const pic_t pic_tab[%d];\nextern const u16 border_color;\nextern const u16 pic_group_pal[%d][16];\n" % (npics, len(GROUP_NAMES))
     for i, gn in enumerate(GROUP_NAMES):
         h += "#define PG_%s %d\n" % (gn, i)
     for g in sorted(GROUP_TEXTFIX):

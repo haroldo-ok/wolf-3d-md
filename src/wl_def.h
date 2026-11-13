@@ -208,9 +208,11 @@ extern u8 actorat[MAPSIZE][MAPSIZE];
 /* actorat holds 0 (nothing), a wall/blocking value (1..0x3F), a door
  * (0x80|n) or an actor: 0x40|id for id<64, 0xC0|(id-64) for id>=64 */
 extern u8 mapplane0[MAPSIZE * MAPSIZE];    /* area numbers / wall tiles (RAM copy) */
-extern const u16 *mapplane1;               /* objects (ROM) */
+extern const u8 *mapplane1;                /* objects (ROM): row index + sparse (x, value) pairs, see gen_maps */
 #define MAPSPOT0(x, y)      (mapplane0[((y) << 6) + (x)])
-#define MAPSPOT1(x, y)      (mapplane1[((y) << 6) + (x)])
+/* index of the current map in mapinfo[] (ten maps per episode) */
+#define MAPINDEX()          (gamestate.episode * 10 + gamestate.mapon)
+u16 MapSpot1(s16 x, s16 y);
 #define ACT_ISACTOR(v)      ((v) & 0x40)
 static inline u8 act_enc(const objtype *o)
 {

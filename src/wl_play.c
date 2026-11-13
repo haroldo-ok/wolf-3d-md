@@ -27,14 +27,6 @@ boolean buttonstate[NUMBUTTONS];
 boolean buttonheld[NUMBUTTONS];
 s16 shootdelta = VIEWW / 10;
 
-/* songs of the first episode, indexed by level */
-const s16 songs[10] =
-{
-    GETTHEM_MUS, SEARCHN_MUS, POW_MUS, SUSPENSE_MUS,
-    GETTHEM_MUS, SEARCHN_MUS, POW_MUS, SUSPENSE_MUS,
-    WARMARCH_MUS, CORNER_MUS
-};
-
 #define BASEMOVE    35
 #define RUNMOVE     70
 #define MAXTICS     10
@@ -376,7 +368,7 @@ dothink:
 
 void StartMusic(void)
 {
-    SD_StartLevelMusic(songs[gamestate.mapon % 10]);
+    SD_StartLevelMusic(mapinfo[MAPINDEX()].song);
 }
 
 void StopMusic(void)
