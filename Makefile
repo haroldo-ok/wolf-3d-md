@@ -6,6 +6,7 @@
 GDK ?= /root/work/sgdk
 WOLF_DATA ?= /root/work/data
 WOLF_SRC ?= /root/work/wolf3d
+export WOLF_PCM_BASE ?= 0x320000
 EXTRA_FLAGS += -Isrc
 
 include $(GDK)/makefile.gen
@@ -18,8 +19,8 @@ LIBGCC := $(GDK)/lib/libgcc.a -Wl,--build-id=none
 data:
 	python3 -I tools/convert.py $(WOLF_DATA) $(WOLF_SRC) .
 
-# The full game's sound data does not fit in the first 4 MB: convert.py then writes src/gen/pcm.bin, which is
-# appended to the ROM as extra 512 KB pages (the code finds them through the SSF mapper window or linearly).
+# The full game's sound data is kept out of the linked image: convert.py then writes src/gen/pcm.bin, which is
+# appended to the ROM at WOLF_PCM_BASE (the code reaches it through the SSF mapper window at 0x380000 or linearly).
 .PHONY: packROM
 release: packROM
 packROM: padROM

@@ -14,46 +14,47 @@ boolean SoundOn = TRUE, MusicOn = TRUE;
 /* ---------------------------------------------------------------- effects */
 
 #if PCM_EXTERN
-/* The sound data lives behind the first 4 MB of the ROM (pcm.bin, appended by tools/packrom.py), in
- * 512 KB pages 8 and up.  A cartridge with the SSF mapper shows one page at a time in the window at
- * 0x380000 (region 7), which nothing else uses; emulators that map larger ROMs linearly simply have the
- * data at 0x400000.  SD_Init finds out which of the two applies by looking for the marker. */
+/* The sound data is appended behind the code and data (pcm.bin, put there by tools/packrom.py at PCM_BASE).
+ * A cartridge with the SSF mapper shows one 512 KB page at a time in the window at 0x380000 (region 7), which
+ * nothing else uses; emulators and carts that map larger ROMs linearly simply have the data at its own address.
+ * Every page from 0x400000 on starts with a marker; SD_Init finds out which of the two applies by looking for it.
+ * Samples never cross a page boundary, and the ones below 0x380000 are reached directly in both cases. */
 #define PCM_PAGE_BITS   19
-#define PCM_FIRST_PAGE  8
 #define PCM_WINDOW      0x380000
-#define PCM_LINEAR      0x400000
+#define PCM_TAGGED      0x400000
 
 static u8 pcm_mode;                 /* 0 = not found (no digitised/AdLib effects), 1 = window, 2 = linear */
 static s16 pcm_page = -1;
 
 static const u8 *pcm_ptr(u32 ofs)
 {
-    if (pcm_mode == 1)
+    u32 a = PCM_BASE + ofs;
+    if (pcm_mode == 1 && a >= PCM_WINDOW)
     {
-        s16 page = ofs >> PCM_PAGE_BITS;
+        s16 page = a >> PCM_PAGE_BITS;
         if (page != pcm_page)
         {
             SND_PCM4_stopPlay(SOUND_PCM_CH1);       /* the driver must not read the old page while it is swapped out */
-            SYS_setBank(7, PCM_FIRST_PAGE + page);
+            SYS_setBank(7, page);
             pcm_page = page;
         }
-        return (const u8 *)(PCM_WINDOW + (ofs & ((1UL << PCM_PAGE_BITS) - 1)));
+        return (const u8 *)(PCM_WINDOW + (a & ((1UL << PCM_PAGE_BITS) - 1)));
     }
-    return (const u8 *)(PCM_LINEAR + ofs);
+    return (const u8 *)a;
 }
 
 static void pcm_detect(void)
 {
     pcm_mode = 0;
-    SYS_setBank(7, PCM_FIRST_PAGE);
-    pcm_page = 0;
+    SYS_setBank(7, 8);
+    pcm_page = 8;
     if (*(vu32 *)PCM_WINDOW == pcm_marker)
         pcm_mode = 1;
     else
     {
         SYS_setBank(7, 7);
         pcm_page = -1;
-        if (*(vu32 *)PCM_LINEAR == pcm_marker)
+        if (*(vu32 *)PCM_TAGGED == pcm_marker)
             pcm_mode = 2;
     }
 }
@@ -108,8 +109,17 @@ boolean SD_PlaySound(u16 sound)
     }
     else if (SoundOn)
     {
-        ofs = t->adlib_ofs;
-        len = t->adlib_len;
+        /* the full game has no AdLib rendering of the sounds that have a digitised one: those play digitised */
+        if (t->adlib_len)
+        {
+            ofs = t->adlib_ofs;
+            len = t->adlib_len;
+        }
+        else
+        {
+            ofs = t->digi_ofs;
+            len = t->digi_len;
+        }
     }
     else
         return FALSE;
